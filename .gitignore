@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包产物与中间目录
+build/
+release/
+debug/
+dist/
+*.exe
+*.spec
+_old_*.exe
+_locked_*.exe
+
+# 运行期数据（与 exe 同目录，属用户数据，不入版本库）
+session.json
+history.json
+app.lock
+用电日报_*.html
+用电报告_*.html
+PC用电汇总.html

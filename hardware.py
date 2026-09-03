@@ -1,0 +1,669 @@
+# -*- coding: utf-8 -*-
+"""本机硬件配置探测 + 实时负载采样（Windows / PowerShell / WMI）。
+
+探测逻辑在真实 Windows PC 上可用；在沙箱/虚拟机中返回对应虚拟硬件信息，
+不影响代码逻辑本身。GPU 实时功耗优先用 nvidia-smi 直读（N 卡真实值），
+其余部件按功耗模型估算。
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import re
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+
+@dataclass
+class HardwareInfo:
+    cpu_name: str = "未知 CPU"
+    cpu_cores: int = 0
+    cpu_threads: int = 0
+    cpu_base_mhz: int = 0
+    gpu_name: str = "未知显卡"
+    gpu_vram_bytes: int = 0
+    gpu_resolution: str = ""
+    ram_bytes: int = 0
+    disks: list = field(default_factory=list)          # [(media_type, size_gb), ...]
+    monitor_count: int = 1
+    has_battery: bool = False
+    gpu_is_nvidia: bool = False
+    os_caption: str = ""
+    raw: dict = field(default_factory=dict)
+
+
+def _decode(raw: bytes) -> str:
+    """PowerShell 输出可能是 UTF-8 或系统默认编码(GBK)，统一安全解码。"""
+    for enc in ("utf-8", "gbk", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def _ps(script: str, timeout: int = 15) -> Optional[str]:
+    """运行一段 PowerShell 并返回文本输出；失败返回 None。"""
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, timeout=timeout,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
+        if proc.returncode != 0:
+            return None
+        return _decode(proc.stdout or b"")
+    except Exception:
+        return None
+
+
+def detect_hardware() -> HardwareInfo:
+    info = HardwareInfo()
+
+    # CPU
+    out = _ps(
+        "(Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,"
+        "NumberOfLogicalProcessors,MaxClockSpeed | ConvertTo-Json)"
+    )
+    if out:
+        try:
+            d = json.loads(out)
+            if isinstance(d, list):
+                d = d[0]
+            info.cpu_name = (d.get("Name") or "未知 CPU").strip()
+            info.cpu_cores = int(d.get("NumberOfCores") or 0)
+            info.cpu_threads = int(d.get("NumberOfLogicalProcessors") or 0)
+            info.cpu_base_mhz = int(d.get("MaxClockSpeed") or 0)
+        except Exception:
+            pass
+
+    # GPU（取第一个带名称的显示适配器；记录是否为 NVIDIA）
+    out = _ps(
+        "(Get-CimInstance Win32_VideoController | Where-Object {$_.Name} | "
+        "Select-Object Name,AdapterRAM,CurrentHorizontalResolution,CurrentVerticalResolution | ConvertTo-Json)"
+    )
+    if out:
+        try:
+            arr = json.loads(out)
+            if isinstance(arr, dict):
+                arr = [arr]
+            for g in arr:
+                name = (g.get("Name") or "").strip()
+                if not name:
+                    continue
+                # 跳过纯虚拟/基础显示适配器
+                if "Virtual" in name or "Basic" in name or "Microsoft" in name:
+                    continue
+                info.gpu_name = name
+                info.gpu_vram_bytes = int(g.get("AdapterRAM") or 0)
+                h = g.get("CurrentHorizontalResolution") or 0
+                v = g.get("CurrentVerticalResolution") or 0
+                if h and v:
+                    info.gpu_resolution = f"{h}x{v}"
+                info.gpu_is_nvidia = "NVIDIA" in name.upper()
+                break
+        except Exception:
+            pass
+
+    # RAM
+    out = _ps("(Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory | ConvertTo-Json)")
+    if out:
+        try:
+            d = json.loads(out)
+            info.ram_bytes = int(d.get("TotalPhysicalMemory") or 0)
+        except Exception:
+            pass
+
+    # 磁盘
+    out = _ps(
+        "(Get-PhysicalDisk | Select-Object MediaType,@{N='SizeGB';E={[math]::Round($_.Size/1GB,1)}} | ConvertTo-Json)"
+    )
+    if out:
+        try:
+            arr = json.loads(out)
+            if isinstance(arr, dict):
+                arr = [arr]
+            for d in arr:
+                info.disks.append((d.get("MediaType") or "未知", float(d.get("SizeGB") or 0)))
+        except Exception:
+            pass
+
+    # 显示器数量
+    out = _ps(
+        "(Get-CimInstance Win32_PnPEntity -Filter \"PNPClass='Monitor'\" | "
+        "Where-Object {$_.Name} | Measure-Object | Select-Object -ExpandProperty Count)"
+    )
+    if out and out.strip().isdigit():
+        info.monitor_count = max(1, int(out.strip()))
+
+    # 电池（笔记本判定）
+    out = _ps("(Get-CimInstance Win32_Battery | Measure-Object | Select-Object -ExpandProperty Count)")
+    if out and out.strip().isdigit() and int(out.strip()) > 0:
+        info.has_battery = True
+
+    # 操作系统
+    out = _ps("(Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption)")
+    if out:
+        info.os_caption = out.strip()
+
+    info.raw = {
+        "cpu": info.cpu_name, "gpu": info.gpu_name,
+        "ram_gb": round(info.ram_bytes / 1e9, 1),
+        "disks": info.disks, "monitors": info.monitor_count,
+    }
+    return info
+
+
+def sample_load() -> dict:
+    """实时采样：返回 {'cpu_load': 0-100, 'gpu_power': float|None, 'gpu_valid': bool}。"""
+    script = r'''
+$result = @{ cpu = 0; gpuPower = $null; gpuValid = $false }
+try {
+    $c = (Get-Counter '\Processor(_Total)\% Processor Time' -ErrorAction Stop).CounterSamples.CookedValue
+    $result.cpu = [math]::Round($c, 1)
+} catch { $result.cpu = 0 }
+
+if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+    try {
+        $p = & nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>$null
+        if ($p) {
+            $v = [double]($p.ToString().Trim().Split([Environment]::NewLine)[0])
+            $result.gpuPower = [math]::Round($v, 1)
+            $result.gpuValid = $true
+        }
+    } catch { $result.gpuValid = $false }
+}
+$result | ConvertTo-Json -Compress
+'''
+    out = _ps(script, timeout=12)
+    if not out:
+        return {"cpu_load": 0.0, "gpu_power": None, "gpu_valid": False}
+    try:
+        d = json.loads(out)
+        return {
+            "cpu_load": float(d.get("cpu") or 0.0),
+            "gpu_power": float(d["gpuPower"]) if d.get("gpuPower") is not None else None,
+            "gpu_valid": bool(d.get("gpuValid")),
+        }
+    except Exception:
+        return {"cpu_load": 0.0, "gpu_power": None, "gpu_valid": False}
+
+
+def collect_system_info() -> dict:
+    """一次性静态系统信息（AIDA64 风格侧栏）。任一环节失败对应键留空，不抛错。"""
+    out = _ps(r'''
+$r = @{}
+try {
+  $os = Get-CimInstance Win32_OperatingSystem
+  $cs = Get-CimInstance Win32_ComputerSystem
+  $bb = Get-CimInstance Win32_BaseBoard
+  $bi = Get-CimInstance Win32_BIOS
+  $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+  $pma = Get-CimInstance Win32_PhysicalMemoryArray | Select-Object -First 1
+  $mods = Get-CimInstance Win32_PhysicalMemory
+  $gpu = Get-CimInstance Win32_VideoController | Where-Object {$_.Name -and $_.Name -notmatch 'Virtual|Basic|Microsoft'} | Select-Object -First 1
+  $fw = $null; $sb = $null
+  try { $fw = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name PEFirmwareType -ErrorAction Stop).PEFirmwareType } catch {}
+  try { $sb = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot' -Name UEFISecureBootEnabled -ErrorAction Stop).UEFISecureBootEnabled } catch {}
+  $tpm = ''
+  try { $t = Get-CimInstance -Namespace root\cimv2\Security\MicrosoftTpm -ClassName Win32_Tpm -ErrorAction Stop; if ($t) { $tpm = ($t.SpecVersion -split ',')[0] } } catch {}
+  $l1 = 0; $l2 = 0; $l3 = 0
+  try {
+    $cm = Get-CimInstance Win32_CacheMemory
+    $l1 = ($cm | Where-Object {$_.Level -eq 3} | Measure-Object InstalledSize -Sum).Sum
+    $l2 = ($cm | Where-Object {$_.Level -eq 4} | Measure-Object InstalledSize -Sum).Sum
+    $l3 = ($cm | Where-Object {$_.Level -eq 5} | Measure-Object InstalledSize -Sum).Sum
+  } catch {}
+  $net = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=true' | Select-Object -First 1
+  $r.os = $os.Caption; $r.osver = $os.BuildNumber; $r.osarch = $os.OSArchitecture
+  $r.comp = $cs.Name; $r.domain = $cs.Domain
+  $r.mb = ('{0} {1}' -f $bb.Manufacturer, $bb.Product).Trim()
+  $r.bios = '{0}  Date: {1}' -f $bi.SMBIOSBIOSVersion, $bi.ReleaseDate
+  $r.cpu = $cpu.Name; $r.cores = $cpu.NumberOfCores; $r.threads = $cpu.NumberOfLogicalProcessors
+  $r.mhz = $cpu.MaxClockSpeed; $r.l1 = $l1; $r.l2 = $l2; $r.l3 = $l3
+  $r.gpuname = $gpu.Name; $r.gpuvram = $gpu.AdapterRAM
+  $r.gpures = '{0}x{1}' -f $gpu.CurrentHorizontalResolution, $gpu.CurrentVerticalResolution
+  $r.gpuref = $gpu.CurrentRefreshRate
+  $r.slots = $pma.MemoryDevices; $r.maxcap = $pma.MaxCapacityEx
+  $r.mods = @($mods | ForEach-Object {
+    [pscustomobject]@{ m = $_.Manufacturer; pn = ('' + $_.PartNumber).Trim();
+      spd = $_.Speed; cap = $_.Capacity; clk = $_.ConfiguredClockSpeed } })
+  $r.fw = $fw; $r.sb = $sb; $r.tpm = $tpm
+  if ($net) {
+    $r.nic = $net.Description; $r.mac = $net.MACAddress
+    $r.ip = ($net.IPAddress | Where-Object { $_ -match '\.' } | Select-Object -First 1)
+    $r.gw = ($net.DefaultIPGateway | Select-Object -First 1)
+  }
+} catch {}
+$r | ConvertTo-Json -Depth 3
+''', timeout=25)
+    d = {}
+    if out:
+        try:
+            d = json.loads(out)
+        except Exception:
+            d = {}
+    if not d.get("fw"):
+        # 注册表回退：PEFirmwareType 1=BIOS 2=UEFI
+        out = _ps("reg query 'HKLM\\SYSTEM\\CurrentControlSet\\Control' /v PEFirmwareType", timeout=6)
+        if out and "PEFirmwareType" in out:
+            m = re.search(r"REG_DWORD\s+0x([0-9a-fA-F]+)", out)
+            if m:
+                d["fw"] = {"1": "Legacy BIOS", "2": "UEFI"}.get(m.group(1).lower(), "")
+    if not d.get("sb") and d.get("fw") == "UEFI":
+        out = _ps("reg query 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot' /v UEFISecureBootEnabled", timeout=6)
+        if out and "0x1" in out:
+            d["sb"] = 1
+    if isinstance(d.get("mods"), dict):
+        d["mods"] = [d["mods"]]
+    # 磁盘（含分区盘符）
+    out = _ps(r'''
+$disks = @()
+try {
+  $disks = Get-PhysicalDisk | Sort-Object DeviceId | ForEach-Object {
+    $d = $_
+    $letters = ''
+    try {
+      $ls = ($d | Get-Disk | Get-Partition | Where-Object DriveLetter |
+        ForEach-Object { '{0}:' -f $_.DriveLetter })
+      $letters = ($ls -join ' ')
+    } catch {}
+    [pscustomobject]@{ model = $d.FriendlyName; media = $d.MediaType; bus = $d.BusType;
+      sizeGB = [math]::Round($d.Size / 1GB, 0); letters = $letters }
+  }
+} catch {}
+$disks | ConvertTo-Json -Depth 3
+''', timeout=20)
+    if out:
+        try:
+            arr = json.loads(out)
+            if isinstance(arr, dict):
+                arr = [arr]
+            d["disks"] = arr
+        except Exception:
+            d["disks"] = []
+    else:
+        d["disks"] = []
+    return d
+
+
+def _cpu_temp_once():
+    """CPU 温度（热区近似，非所有主板可用）；失败返回 None。"""
+    out = _ps("(Get-CimInstance Win32_PerfFormattedData_Counters_ThermalZoneInformation "
+              "| Select-Object -First 1).Temperature", timeout=6)
+    if not out:
+        return None
+    try:
+        v = float(out.strip())
+        # 多数驱动以 1/10 开尔文上报；>1000 视为该格式，换算成摄氏度
+        if v > 1000:
+            v = v / 10.0 - 273.15
+        if -20 < v < 150:
+            return round(v, 1)
+    except Exception:
+        pass
+    return None
+
+
+def _disk_temps_once() -> dict:
+    """各物理磁盘温度（StorageReliabilityCounter；非管理员可能拿不到，返回空表）。"""
+    out = _ps(r'''
+$out = @()
+try {
+  $out = Get-PhysicalDisk | ForEach-Object {
+    $d = $_; $t = $null
+    try { $t = ($d | Get-StorageReliabilityCounter -ErrorAction Stop).Temperature } catch {}
+    if ($t) { [pscustomobject]@{ m = $d.FriendlyName; t = [double]$t } }
+  }
+} catch {}
+$out | ConvertTo-Json -Depth 2
+''', timeout=10)
+    d = {}
+    if out:
+        try:
+            arr = json.loads(out)
+            if isinstance(arr, dict):
+                arr = [arr]
+            for x in arr:
+                try:
+                    d[str(x.get("m"))] = float(x.get("t"))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return d
+
+
+def sample_dynamic(prev_net):
+    """轻量动态信息（psutil 进程内，微秒级）：内存/CPU频率/网速/开机时间。
+    prev_net: 上次 (ts, sent, recv) 或 None。返回 (info, cur_net)。"""
+    info = {}
+    cur = None
+    if psutil is not None:
+        try:
+            vm = psutil.virtual_memory()
+            info["ram_total"] = vm.total
+            info["ram_used"] = vm.total - vm.available
+            info["ram_pct"] = vm.percent
+        except Exception:
+            pass
+        try:
+            f = psutil.cpu_freq()
+            if f:
+                info["mhz"] = int(f.current)
+        except Exception:
+            pass
+        try:
+            info["boot"] = psutil.boot_time()
+        except Exception:
+            pass
+        try:
+            io = psutil.net_io_counters()
+            cur = (time.time(), io.bytes_sent, io.bytes_recv)
+            if prev_net and cur[0] > prev_net[0]:
+                dt = cur[0] - prev_net[0]
+                info["down_kbs"] = max(0.0, (cur[2] - prev_net[2]) / dt / 1024.0)
+                info["up_kbs"] = max(0.0, (cur[1] - prev_net[1]) / dt / 1024.0)
+        except Exception:
+            pass
+    return info, cur
+
+
+class PersistentSampler:
+    """常驻采样器：CPU 负载与每进程 CPU 时间用 psutil 在进程内直接读取
+    （零子进程、无管道缓冲问题），N 卡功耗用 nvidia-smi -l 常驻流 + 后台读线程。
+    旧方案每周期 spawn PowerShell（每次数百 ms CPU）是整机卡顿来源之一。
+    GPU 流断/启动失败自动降级；psutil 缺失时 start() 抛错，由调用方回退旧方案。"""
+
+    _STALE_MIN = 8.0   # GPU 最新值的最长可信时长（s）
+
+    def __init__(self, interval_ms: int = 2000, gpu_nvidia: bool = True):
+        self.interval_ms = max(1000, int(interval_ms))
+        self.gpu_nvidia = bool(gpu_nvidia)
+        self._gpu_proc = None
+        self._lock = threading.Lock()
+        self._gpu_val = (None, None, False, 0.0)  # (功耗W, GPU温度°C, valid, ts)
+        self._psutil = None
+        self._net_prev = None
+        self._n_samples = 0
+        self._cpu_temp = None
+        self._cpu_temp_every = max(10, int(30000 // max(1000, interval_ms)))  # ≈每 30s 测一次
+        self._disk_temps = {}
+        self._disk_temp_every = max(10, int(60000 // max(1000, interval_ms)))  # ≈每 60s 测一次
+        self._dt_busy = False
+
+    def start(self):
+        if psutil is None:
+            raise RuntimeError("psutil 不可用")
+        self._psutil = psutil
+        psutil.cpu_percent(interval=None)   # 首调仅建立基线
+        if self.gpu_nvidia:
+            try:
+                self._gpu_proc = subprocess.Popen(
+                    ["nvidia-smi", "--query-gpu=power.draw,temperature.gpu",
+                     "--format=csv,noheader,nounits",
+                     "-l", str(max(1, self.interval_ms // 1000))],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    creationflags=0x08000000)
+                threading.Thread(target=self._gpu_reader, daemon=True).start()
+            except Exception:
+                self._gpu_proc = None
+
+    _SKIP_NAMES = {"system idle process", "system", "idle"}   # 空闲/内核占位，不做分摊展示
+
+    def _collect_apps(self) -> dict:
+        """各进程累计 CPU 秒（user+system），按进程名聚合。"""
+        m = {}
+        for p in self._psutil.process_iter():
+            try:
+                nm = p.name() or "?"
+                if nm.lower() in self._SKIP_NAMES:
+                    continue
+                t = p.cpu_times()
+                m[nm] = m.get(nm, 0.0) + (t.user + t.system)
+            except Exception:
+                continue
+        return m
+
+    def _gpu_reader(self):
+        try:
+            while True:
+                raw = self._gpu_proc.stdout.readline()
+                if not raw:
+                    break
+                s = _decode(raw).strip()
+                if not s:
+                    continue
+                try:
+                    parts = s.split(",")
+                    v = float(parts[0])
+                    temp = float(parts[1]) if len(parts) > 1 else None
+                    with self._lock:
+                        self._gpu_val = (v, temp, True, time.time())
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _ct_probe(self):
+        """后台 CPU 温度探测：成功则更新缓存，失败保持旧值；结束释放忙碌标志。"""
+        try:
+            t = _cpu_temp_once()
+            if t is not None:
+                self._cpu_temp = t
+        finally:
+            self._ct_busy = False
+
+    def _dt_probe(self):
+        """后台磁盘温度探测（约 60s 一次）。"""
+        try:
+            t = _disk_temps_once()
+            if t:
+                self._disk_temps = t
+        finally:
+            self._dt_busy = False
+
+    def sample(self) -> dict:
+        now = time.time()
+        stale = max(3.0 * self.interval_ms / 1000.0, self._STALE_MIN)
+        with self._lock:
+            gpu_p, gpu_t, _gpu_ok, gpu_ts = self._gpu_val
+        gpu_fresh = gpu_ts > 0 and (now - gpu_ts) <= stale
+        self._n_samples += 1
+        # v18.2/v18.3：温度探测（spawn PS 可达数秒）放独立线程，绝不阻塞 sample()
+        if self._n_samples % self._cpu_temp_every == 1 and not getattr(self, "_ct_busy", False):
+            self._ct_busy = True
+            threading.Thread(target=self._ct_probe, daemon=True).start()
+        if self._n_samples % self._disk_temp_every == 1 and not self._dt_busy:
+            self._dt_busy = True
+            threading.Thread(target=self._dt_probe, daemon=True).start()
+        sysinfo, self._net_prev = sample_dynamic(self._net_prev)
+        if gpu_fresh and gpu_t is not None:
+            sysinfo["gpu_temp"] = gpu_t
+        if self._cpu_temp is not None:
+            sysinfo["cpu_temp"] = self._cpu_temp
+        if self._disk_temps:
+            sysinfo["disk_temps"] = dict(self._disk_temps)
+        return {
+            "cpu_load": float(self._psutil.cpu_percent(interval=None)),
+            "gpu_power": gpu_p if (self.gpu_nvidia and gpu_fresh) else None,
+            "gpu_valid": bool(self.gpu_nvidia and gpu_fresh),
+            "apps": (now, self._collect_apps()),
+            "sys": sysinfo,
+        }
+
+    def stop(self):
+        try:
+            if self._gpu_proc is not None and self._gpu_proc.poll() is None:
+                self._gpu_proc.kill()
+        except Exception:
+            pass
+        self._gpu_proc = None
+
+
+def cpu_load_quick() -> float:
+    """仅取 CPU 负载百分比（用于非 N 卡估算 GPU 负载的近似）。"""
+    out = _ps(r"(Get-Counter '\Processor(_Total)\% Processor Time').CounterSamples.CookedValue", timeout=8)
+    if out:
+        try:
+            return float(out.strip())
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.0f}PB"
+
+
+# ---------------- 显示器开关状态推断 ----------------
+# 限制说明：Windows 没有稳定公开的 API 能读取显示器 DPMST 真实状态，
+# GetDevicePowerState("\\\\.\\DISPLAY1") 在多数机器上 CreateFile 即失败。
+# 因此采用「用户空闲时长 >= 系统熄屏超时」来推断*系统自动熄屏*；
+# 用户手动按显示器电源键关屏无法自动感知，由 UI 手动开关覆盖。
+_disp_cache = {"timeout": None, "ts": 0.0}
+_DISP_TIMEOUT_TTL = 300.0
+
+
+def display_off_timeout_sec() -> int:
+    """系统电源方案「关闭显示器」超时（秒）。失败回退 600s，带 5 分钟缓存。"""
+    now = time.time()
+    c = _disp_cache
+    if c["timeout"] is not None and (now - c["ts"]) < _DISP_TIMEOUT_TTL:
+        return c["timeout"]
+    val = 600
+    try:
+        # PyInstaller --windowed 打包下必须带 CREATE_NO_WINDOW，
+        # 否则子进程会尝试创建控制台窗口并挂死调用方（采样线程）
+        _cf = 0x08000000 if sys.platform == "win32" else 0
+        out = subprocess.run(
+            ["powercfg", "/query", "SCHEME_CURRENT", "SUB_VIDEO", "VIDEOIDLE"],
+            capture_output=True, text=True, timeout=8,
+            encoding="utf-8", errors="ignore", creationflags=_cf)
+        secs = re.findall(r"0x([0-9a-fA-F]{8})", out.stdout or "")
+        if secs:
+            v = int(secs[-1], 16)
+            if 0 < v < 86400:
+                val = v
+    except Exception:
+        pass
+    c["timeout"] = val
+    c["ts"] = now
+    return val
+
+
+def user_idle_sec() -> float:
+    """用户键鼠空闲秒数（GetLastInputInfo）；非 Windows 或调用失败返回 0。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+        lii = LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            tick = ctypes.windll.kernel32.GetTickCount()
+            return max(0.0, (tick - lii.dwTime) / 1000.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def foreground_fullscreen() -> bool:
+    """是否有「真全屏」窗口占据所在显示器（看视频 / 演示 / 全屏游戏）。
+
+    只凭空闲时长判断熄屏会把整场电影误判成熄屏（鼠标键盘不动，但屏幕亮着），
+    白白少算显示器那一档功耗。这里用窗口特征区分：
+      · 真全屏：无标题栏，或置顶 —— 视频播放器 F11、PPT 放映、全屏游戏
+      · 最大化：仍带标题栏 —— 人可能只是开着窗口走开了，不算
+    非 Windows 或探测失败一律返回 False（宁可按空闲判断，不改变既有行为）。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD)]
+
+        u = ctypes.windll.user32
+        u.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
+        u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        u.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+        u.GetMonitorInfoW.argtypes = (ctypes.c_ulong, ctypes.POINTER(_MONITORINFO))
+
+        hwnd = u.GetForegroundWindow()
+        if not hwnd:
+            return False
+
+        GWL_STYLE, GWL_EXSTYLE = -16, -20
+        WS_CAPTION, WS_EX_TOPMOST = 0x00C00000, 0x00000008
+        style = u.GetWindowLongPtrW(hwnd, GWL_STYLE)
+        exstyle = u.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+        # 有标题栏且不置顶 → 普通窗口/最大化，不算全屏
+        if (style & WS_CAPTION) and not (exstyle & WS_EX_TOPMOST):
+            return False
+
+        r = wintypes.RECT()
+        if not u.GetWindowRect(hwnd, ctypes.byref(r)):
+            return False
+
+        # 按窗口所在的那块屏判断，多屏环境下才准
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        hmon = u.MonitorFromWindow(hwnd, 2)          # MONITOR_DEFAULTTONEAREST
+        if hmon and u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            mw = mi.rcMonitor.right - mi.rcMonitor.left
+            mh = mi.rcMonitor.bottom - mi.rcMonitor.top
+        else:
+            mw = u.GetSystemMetrics(0)               # SM_CXSCREEN
+            mh = u.GetSystemMetrics(1)               # SM_CYSCREEN
+        if mw <= 0 or mh <= 0:
+            return False
+        return (r.right - r.left) >= mw and (r.bottom - r.top) >= mh
+    except Exception:
+        return False
+
+
+def display_auto_off(grace: float = 3.0) -> bool:
+    """推断系统是否已自动熄屏：空闲时长超过系统熄屏超时（留 grace 秒余量）。
+
+    例外：有真全屏窗口时（看视频/放映/全屏游戏）即便长时间无输入也视为屏幕亮着。
+    """
+    try:
+        if foreground_fullscreen():
+            return False
+        return user_idle_sec() >= (display_off_timeout_sec() + grace)
+    except Exception:
+        return False
+
+
+if __name__ == "__main__":
+    h = detect_hardware()
+    print("CPU:", h.cpu_name, h.cpu_cores, "C", h.cpu_threads, "T")
+    print("GPU:", h.gpu_name, h.gpu_resolution, "NVIDIA=", h.gpu_is_nvidia)
+    print("RAM:", human_bytes(h.ram_bytes))
+    print("Disks:", h.disks)
+    print("Monitors:", h.monitor_count, "Battery:", h.has_battery)
+    import time
+    for _ in range(3):
+        print("sample:", sample_load())
+        time.sleep(1)

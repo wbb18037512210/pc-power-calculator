@@ -1,0 +1,88 @@
+# PC 电脑用电电费计算器 — 变更日志
+
+PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到桌面。
+数据文件（session.json / history.json / 用电日报）与 exe 同目录 —— 冻结版 `BASE_DIR = dirname(sys.executable)`。
+
+---
+
+## v18.13 — 全屏豁免：看视频不得被误判成熄屏
+
+- **问题**：v18.11 起靠「空闲时长 ≥ 系统息屏超时」推断熄屏。但看电影 / 视频会议 / PPT 放映时，
+  鼠标键盘长时间无输入，屏幕其实亮着 —— 会被误判为熄屏，整场电影都少算显示器那一档（30W）。
+- **修法**：`hardware.foreground_fullscreen()` 探测**真全屏**窗口（ctypes）：
+  - 判定为真全屏 = 窗口铺满所在显示器 **且**（无标题栏 **或** 置顶）。
+  - 仅最大化（仍带标题栏）**不算** —— 人可能只是开着窗口走开了。
+  - 多屏环境按 `MonitorFromWindow` + `GetMonitorInfo` 取窗口所在那块屏，不是主屏。
+  - 探测失败一律返回 False（宁可退回空闲判断，不改变既有行为）。
+- `display_auto_off()` 增加豁免：有真全屏窗口时直接返回 False（屏幕亮着）。
+- 手动标记仍然优先于全屏推断（`_display_manual` 三态 > 自动）。
+- 实机验证：造一个 2560×1440 置顶无边框窗口 → `foreground_fullscreen()=True`、
+  `display_auto_off()=False`；销毁后 → `False` / `True`。
+- 回归新增 `fullscreen exemption OK`（全屏→亮屏、久空闲→熄屏、手动优先）。
+
+## v18.12 — 动态电源效率曲线 + 硬件重检测
+
+起因：用户提出「每增加或者减少驱动应该会影响效率」+「显示器关闭时驱动会有提示」。
+
+### 显示器关闭时驱动能否提示 —— 结论：不能
+- `nvidia-smi --query-gpu=display_attached,display_active`：息屏期间仍是 `Yes / Enabled`。
+  驱动只知道线缆是否接上、显示是否初始化，**不掌握 DPMS 息屏状态**。
+- `GetDevicePowerState("\\.\DISPLAY1" / "\\.\LCD")`：本机 CreateFile 阶段即失败，不可用。
+- Windows 无公开的显示器开关查询 API → 只能靠空闲推断 + 手动覆盖。
+
+### 动态电源效率曲线
+- `power_model.PSU_EFF_CURVE`（80 PLUS 金牌典型曲线）+ `psu_eff_at(load_w, rating_w)`：
+  5%→0.70 / 10%→0.82 / 20%→0.87 / 30%→0.895 / 50%→0.90 / 75%→0.88 / 100%→0.85，线性插值，超额定截断。
+- `estimate()` 用 `psu_eff_at(calib_host, psu_rating_w)`；`rating <= 0` 返回 None → 回落固定效率，
+  **未设置时行为与旧版完全一致**。按校准后的主机 DC 负载取点，物理上更准。
+- 返回值新增 `psu_eff`；`on_sample()` 的 `self.cur` 同步带上该字段（初版漏了，UI 会一直读到 None）。
+- UI：设置面板新增「电源额定功率」（0–2000W，0 = 不启用）；读数区显示实时效率 + 「（动态）」角标。
+- 电源建议改为按**主机峰值**计算（剔除显示器，因其走市电）+ 峰值点效率。
+
+### 硬件重检测（对应「增减驱动」的另一半）
+- 模型原先只在启动时 `build_model(detect_hardware())` 构建一次，运行中插拔硬盘 / 显示器估算值不变。
+- 系统信息面板顶部新增「⟳ 重新检测硬件」按钮 → `_redetect_hardware()`：
+  重跑检测 + 重建模型，**继承** psu_efficiency / psu_rating_w / calib_*（不会冲掉校准），
+  刷新面板并弹窗列出变化部件与静态 / 峰值功耗差值；无变化则提示未检测到变化。
+
+### 测试隔离（重要修复）
+- `test_headless.py` 原先开头直接 `os.remove(session.json / history.json)` 再写回测试假值，
+  会毁掉所在目录的真实累计数据。现改为把 `BASE_DIR / SESSION_FILE / HISTORY_FILE / LOCK_FILE`
+  全部重定向到 `tempfile.mkdtemp()`，atexit 时 rmtree。已验证跑测试前后真实文件 mtime 不变。
+
+## v18.11 — 显示器开关状态接入功耗模型 + 悬浮窗半透明
+
+修「关屏后累计电量还在涨」：
+1. 正常部分 —— 关屏只切断显示器，主机照常耗电，累计电量本就该涨。
+2. Bug 部分 —— 显示器 30W 被写成恒定静态项，关屏后估算一点没降（按 226W 计费，实为 190W）。
+
+- 显示器状态检测：无可靠公开 API（`GetDevicePowerState` 实测失败）→
+  `display_auto_off()` 用空闲时长 ≥ `powercfg VIDEOIDLE` 超时（本机 300s）+ 3s 余量推断；
+  托盘菜单三态手动覆盖（`_disp_manual`：自动 / 记为开启 / 记为关闭）。
+- 模型改造：`PowerModel.monitor_w`；`calibrated()` 只接收主机功耗；显示器**既不参与校准映射，
+  也不参与电源效率折算**。三种校准模式下开关差值恒等于 30.0W（初版曾因显示器被算两次得到 65.3W / 39W）。
+- 口径变化：开屏插墙 225.8 → **220.5W**，关屏 **190.5W**。
+- UI：读数区尾部追加「显示器已关（省 30W，累计省 x.xxx 度）」，`_disp_saved_wh` 持久化。
+- 悬浮窗半透明：设置抽屉背景 `rgba(255,255,255,216)`；**必须同步把 `QWidget#settingsPanel`
+  改为 transparent**，否则子控件实心盖掉效果；MiniOverlay alpha 228 → 196。
+
+### v18.11 修订 — 熄屏标记自动恢复 + 设置面板下拉
+- 手动标记「关闭」后若忘了切回会长期低估 → `DISP_WAKE_IDLE_SEC = 20s`：
+  手动标记 False 时若 `user_idle_sec() < 20` 说明人已回来，自动恢复按开屏计。
+- 设置面板新增「显示器状态」三态 QComboBox。
+- 部署坑：桌面 exe 被零线程僵尸持有文件映射，`Copy-Item -Force` 失败却**不终止脚本**，
+  导致启动的仍是旧版 → 改为**先 `Rename-Item` 隔离再 Copy**。
+
+### v18.11 修订2 — 单实例心跳接管 + 周期落盘
+- 严重故障：程序能启动但完全不采样、不写 session、无报错。
+  真根因是早期 `timeout 25` 只杀了 bootloader 父进程，**子进程成孤儿并持续持有单实例互斥体**，
+  之后变僵尸（杀不掉）却仍占着锁 → 每次启动都命中 `ERROR_ALREADY_EXISTS` 并弹「已在运行」阻塞。
+- 解法：互斥体 + **心跳文件**双重判定（`app.lock`，20s 一跳，新鲜阈值 45s），
+  僵尸持锁时新实例直接接管，`_beat()` 抢占所有权。
+- 采样每 30 拍（约 105s）自动落盘一次，避免强杀 / 崩溃丢掉全部累计量。
+
+## v18.10（未单独交付，随 v18.11 一并发布）
+
+- 设置浮层加标题栏 ✕ 按钮 + Esc 收起。
+- 设置表单新增「迷你悬浮窗」复选框，保存时联动 `_toggle_mini`。
+- 托盘菜单新增「生成昨日日报」。
