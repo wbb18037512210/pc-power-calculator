@@ -39,6 +39,8 @@ DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设�
 APP_VERSION = "v18.13"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 2000
+# v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
+PSU_COMMON = (300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 1000)
 # v18.11 手动标记「显示器已关」后，若检测到键鼠空闲短于该值，
 # 说明人已回来，自动恢复按开屏计费，避免忘记切回导致长期低估
 DISP_WAKE_IDLE_SEC = 20.0
@@ -773,6 +775,21 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _suggest_psu_rating(self) -> int:
+        """v18.13 估算电源额定功率：主机峰值 ÷ 标称效率 + 30% 余量，取最接近的常见档位。
+
+        多数用户说不清电源铭牌，而「额定功率 = 0」意味着动态效率曲线一直不启用。
+        给一个基于当前硬件的估算起点，比停在 0 上强；估算值只用于取档位，
+        不参与任何功耗计算，用户随时可改成真实铭牌值。
+        """
+        try:
+            _mon_pk = float(getattr(self.model, "monitor_w", 0.0) or 0.0)
+            host_pk = max(1.0, float(self.model.peak_sys) - _mon_pk)
+            need = host_pk / 0.88 * 1.3          # 0.88 = 中等负载标称效率
+            return int(min(PSU_COMMON, key=lambda c: abs(c - need)))
+        except Exception:
+            return 0
+
     def _redetect_hardware(self):
         """v18.12 重新采集硬件并重建功耗模型。
 
@@ -1455,10 +1472,21 @@ class MainWindow(QMainWindow):
         eff = QDoubleSpinBox(); eff.setRange(0.70, 0.98); eff.setDecimals(2)
         eff.setValue(self.psu_eff)
         # v18.11 电源额定功率：填了才启用动态效率曲线，0 = 不启用
+        # v18.13 增加「按推荐填入」——很多人说不清电源铭牌，给个估算起点总好过一直停在 0
         pr = QSpinBox(); pr.setRange(0, 2000); pr.setSingleStep(50)
         pr.setValue(int(getattr(self, "psu_rating_w", 0) or 0)); pr.setSuffix(" W")
         pr.setToolTip("填电源铭牌额定功率（如 500 / 600），将按 80 PLUS 曲线\n"
                       "随负载率动态计算转换效率；填 0 则使用下方固定的电源效率。")
+        pr_w = QWidget(); pr_l = QHBoxLayout(pr_w)
+        pr_l.setContentsMargins(0, 0, 0, 0); pr_l.setSpacing(6)
+        pr_l.addWidget(pr, 1)
+        btn_pr = QPushButton("按推荐填入")
+        btn_pr.setFixedWidth(86)
+        btn_pr.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_pr.setToolTip("按「主机峰值 ÷ 效率 + 30% 余量」估算，取最接近的常见额定档位。\n"
+                          "不确定电源铭牌时先填它，日后再按实际铭牌改。")
+        btn_pr.clicked.connect(lambda: pr.setValue(self._suggest_psu_rating()))
+        pr_l.addWidget(btn_pr)
         samp = QSpinBox(); samp.setRange(1000, 10000); samp.setSingleStep(500)
         samp.setValue(self.sample_ms); samp.setSuffix(" 毫秒")
         # 计费方式
@@ -1493,7 +1521,7 @@ class MainWindow(QMainWindow):
         cpeak = QDoubleSpinBox(); cpeak.setRange(0, 3000); cpeak.setDecimals(0)
         cpeak.setValue(self.calib_peak); cpeak.setSuffix(" W")
         fl.addRow("电价", rate); fl.addRow("监测时长", win)
-        fl.addRow("电源效率", eff); fl.addRow("电源额定功率", pr)
+        fl.addRow("电源效率", eff); fl.addRow("电源额定功率", pr_w)
         fl.addRow("采样间隔", samp)
         fl.addRow(QLabel("<b>计费方式</b>"), QLabel(""))
         fl.addRow("  方式", mode)

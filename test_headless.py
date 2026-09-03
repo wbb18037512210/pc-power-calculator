@@ -611,6 +611,23 @@ assert "主机峰值" in w.psu_hint.text() and "效率" in w.psu_hint.text(), w.
 print("psu hint OK |", w.psu_hint.text())
 
 
+# ---- v18.13 电源额定功率「按推荐填入」----
+from PySide6.QtWidgets import QPushButton as _QPBtn
+_sug = w._suggest_psu_rating()
+assert _sug in main.PSU_COMMON, "推荐值必须落在常见档位里: %r" % (_sug,)
+_host_pk = float(w.model.peak_sys) - float(w.model.monitor_w)
+_need = _host_pk / 0.88 * 1.3
+assert abs(_sug - _need) <= 75, "应取最接近的档位: 建议 %r vs 需求 %.1f" % (_sug, _need)
+assert _host_pk <= _sug, "推荐额定功率必须 >= 主机峰值，否则负载率会超过 100%"
+w.open_settings()
+_prw = w._sw["pr"].parentWidget()
+_btns = _prw.findChildren(_QPBtn)
+assert len(_btns) == 1, "额定功率行应有且只有一个按钮: %r" % (_btns,)
+w._sw["pr"].setValue(0)
+_btns[0].click()          # 真实点击
+assert w._sw["pr"].value() == _sug, (w._sw["pr"].value(), _sug)
+print("psu rating suggestion OK | 主机峰值 %.0fW -> 推荐 %dW (点击已写入)" % (_host_pk, _sug))
+
 # ---- v18.13 全屏豁免：看视频不得被误判成熄屏 ----
 _f_orig = main.H.foreground_fullscreen, main.H.user_idle_sec
 try:
