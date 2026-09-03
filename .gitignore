@@ -12,6 +12,10 @@ dist/
 _old_*.exe
 _locked_*.exe
 
+# 构建 / 调试过程日志
+*.log
+test_out.txt
+
 # 运行期数据（与 exe 同目录，属用户数据，不入版本库）
 session.json
 history.json
