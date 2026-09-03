@@ -420,6 +420,37 @@ assert main._acquire_single_instance(_mn + "_probe_unique") is True, "空闲锁�
 _holder.kill(); _holder.wait()
 print("single-instance OK (held->False, free->True)")
 
+# v18.13 回归：心跳新鲜 ≠ 持有者还活着（45 秒内重启不得被自己拦在门外）
+_mn2 = _mn + "_restart_probe"
+_lk = main.LOCK_FILE
+_holder2 = _sp.Popen([sys.executable, "-c",
+    "import ctypes,time; ctypes.windll.kernel32.CreateMutexW(None,False,%r); time.sleep(25)" % _mn2])
+time.sleep(1.2)
+# ① 心跳新鲜 + 持有者存活 → 拒绝启动
+with open(_lk, "w", encoding="utf-8") as _f:
+    _f.write("%.3f %d" % (time.time(), _holder2.pid))
+assert main._acquire_single_instance(_mn2) is False, "心跳新鲜且持有者存活 → 应拒绝"
+# ② 心跳新鲜但持有者已死（刚关掉就重启，v18.12 会误拦）→ 必须放行
+_dead = _sp.Popen([sys.executable, "-c", "pass"]); _dead.wait()
+with open(_lk, "w", encoding="utf-8") as _f:
+    _f.write("%.3f %d" % (time.time(), _dead.pid))
+assert main._acquire_single_instance(_mn2) is True, "心跳新鲜但持有者已死 → 应接管"
+# ③ 旧格式心跳（只有时间戳、无 PID）→ 兼容放行
+with open(_lk, "w", encoding="utf-8") as _f:
+    _f.write("%.3f" % time.time())
+assert main._acquire_single_instance(_mn2) is True, "旧格式心跳应兼容放行"
+# ④ _pid_alive 基本正确性
+assert main._pid_alive(os.getpid()) is True, "自身 PID 应判定存活"
+assert main._pid_alive(_dead.pid) is False, "已退出进程应判定死亡"
+assert main._pid_alive(0) is False, "PID 0 应判定无效"
+# ⑤ _beat 写入的必须是「时间戳 + PID」两段
+main._beat()
+with open(_lk, "r", encoding="utf-8") as _f:
+    _parts = _f.read().split()
+assert len(_parts) == 2 and int(_parts[1]) == os.getpid(), _parts
+_holder2.kill(); _holder2.wait()
+print("restart-within-45s OK (dead owner -> take over)")
+
 # v18.6 回归2：托盘悬停实时功率（offscreen 无托盘，用桩验证 tooltip 内容）
 class _FakeTray:
     def __init__(self): self._tt = ""

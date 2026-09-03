@@ -57,21 +57,62 @@ LOCK_FRESH_SEC = 45.0      # 心跳新鲜阈值（心跳每 20s 写一次）
 
 
 def _beat():
-    """写入心跳时间戳。"""
+    """写入心跳：时间戳 + 本进程 PID。
+
+    v18.13 起带上 PID —— 只有时间戳无法区分「还活着」和「刚被关掉」：
+    刚退出的实例心跳也是新鲜的，45 秒内重启会被自己拦在门外。
+    """
     try:
         with open(LOCK_FILE, "w", encoding="utf-8") as f:
-            f.write("%.3f" % time.time())
+            f.write("%.3f %d" % (time.time(), os.getpid()))
     except Exception:
         pass
 
 
 def _last_beat() -> float:
-    """读取上次心跳时间戳（无文件或损坏返回 0）。"""
+    """读取上次心跳时间戳（无文件或损坏返回 0）。兼容旧版只有时间戳的格式。"""
     try:
         with open(LOCK_FILE, "r", encoding="utf-8") as f:
-            return float(f.read().strip() or 0)
+            return float((f.read().split() or ["0"])[0])
     except Exception:
         return 0.0
+
+
+def _beat_pid() -> int:
+    """心跳里记录的持有者 PID（旧格式无 PID 时返回 0）。"""
+    try:
+        with open(LOCK_FILE, "r", encoding="utf-8") as f:
+            parts = f.read().split()
+        return int(parts[1]) if len(parts) > 1 else 0
+    except Exception:
+        return 0
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否仍在运行（v18.13）。心跳新鲜不等于持有者还活着。"""
+    if not pid:
+        return False
+    if sys.platform != "win32":
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except Exception:
+            return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = wintypes.DWORD()
+            ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+            return bool(ok) and code.value == 259      # 259 = STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
 
 CSS = """
 QMainWindow { background: #f4f6f9; }
@@ -2621,6 +2662,10 @@ def _acquire_single_instance(mutex_name: str = "PC用电电费计算器_SingleIn
     强杀残留的僵尸进程会一直持有互斥体却无法被清理，若只看互斥体，
     后续每次启动都会被误判为「已在运行」，弹出模态框后阻塞（无人点击）
     ——程序看似启动却完全不工作。心跳过期即判定持有者已死，允许接管。
+
+    v18.13：光看心跳新鲜度还不够。刚被关掉的实例心跳同样是新鲜的，
+    45 秒内重启会被自己拦在门外（实测复现）。所以再加一道：
+    心跳里记的 PID 必须真的还活着，才算「确有实例在跑」。
     """
     if sys.platform != "win32":
         _beat()
@@ -2629,18 +2674,28 @@ def _acquire_single_instance(mutex_name: str = "PC用电电费计算器_SingleIn
     k32 = ctypes.windll.kernel32
     k32.CreateMutexW(None, False, mutex_name)
     held = k32.GetLastError() == 183      # 183 = ERROR_ALREADY_EXISTS
-    if held and (time.time() - _last_beat()) < LOCK_FRESH_SEC:
-        return False                      # 确有活实例在运行
+    if held:
+        fresh = (time.time() - _last_beat()) < LOCK_FRESH_SEC
+        if fresh and _pid_alive(_beat_pid()):
+            return False                  # 确有活实例在运行
     _beat()                               # 接管：抢占心跳所有权
     return True
 
 
 def main():
     if not _acquire_single_instance():
-        # 已有实例在后台监测：提示后直接退出，避免多实例争抢 session.json / 重复托盘图标
+        # 已有实例在后台监测：提示后退出，避免多实例争抢 session.json / 重复托盘图标。
+        # v18.13：原写法是静态模态框，无人点确定就会永远挂着（用户熄屏时尤其容易发生），
+        # 表现为「进程在、但不采样不落盘」。改为 8 秒后自动关闭并退出。
         app = QApplication.instance() or QApplication(sys.argv)
-        QMessageBox.information(None, "已在运行",
-                                "PC 用电电费计算器 已在后台监测中。\n请查看任务栏右下角托盘图标。")
+        box = QMessageBox(QMessageBox.Icon.Information, "已在运行",
+                          "PC 用电电费计算器 已在后台监测中。\n"
+                          "请查看任务栏右下角托盘图标。\n\n"
+                          "（本提示 8 秒后自动关闭）",
+                          QMessageBox.StandardButton.Ok)
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        QTimer.singleShot(8000, box.close)
+        box.exec()
         sys.exit(0)
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei", 10))
