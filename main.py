@@ -42,7 +42,7 @@ import hardware as H
 import power_model as PM
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.18"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.25"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 2000
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -217,6 +217,33 @@ class SampleWorker(QThread):
         self._sampler = None
 
 
+def _cfg_compact(hw) -> list:
+    """v18.19 悬浮窗右上角配置信息：压缩成短型号，224px 宽度内一眼可读。
+
+    例：'12th Gen Intel(R) Core(TM) i5-12400' → 'i5-12400'；
+        'NVIDIA GeForce RTX 3060' → 'GPU RTX 3060'。
+    """
+    import re
+    out = []
+    cpu = (getattr(hw, "cpu_name", "") or "").replace(
+        "(R)", "").replace("(TM)", "").replace("®", "").replace("™", "")
+    m = (re.search(r"\bi[3579]-?\d{3,5}[A-Z]{0,3}\b", cpu)
+         or re.search(r"Ryzen\s*\d\s*\w*", cpu, re.I)
+         or re.search(r"\bA\d-\d{4}\b", cpu))
+    out.append(m.group(0) if m else cpu.strip()[:16])
+    gpu = (getattr(hw, "gpu_name", "") or "")
+    m = (re.search(r"(RTX|GTX|RX)\s*\d{3,4}\s*\w*", gpu, re.I)
+         or re.search(r"Radeon\s+\w+", gpu, re.I)
+         or re.search(r"Arc\s+A\d+", gpu, re.I))
+    out.append(("GPU " + m.group(0)) if m else (gpu.strip()[:16] if gpu else ""))
+    if getattr(hw, "ram_bytes", 0):
+        out.append("内存 %.0fG" % (hw.ram_bytes / 1e9))
+    mc = getattr(hw, "monitor_count", 0)
+    if mc:
+        out.append("%d 屏" % mc)
+    return [x for x in out if x]
+
+
 class MiniOverlay(QWidget):
     """v18.15 桌面迷你悬浮窗：贴着桌面显示、背景全透明、可拖动、右键切层级。
 
@@ -239,27 +266,66 @@ class MiniOverlay(QWidget):
         super().__init__(None)
         self._on_top = bool(on_top)
         self._show_bd = bool(show_bd)
+        self._last_cfg = ""
         self.setWindowFlags(self._flags_for(self._on_top))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 10, 14, 10)
-        root.setSpacing(1)
+        root.setSpacing(6)
+
+        # 顶部：左=实时功率/状态/电费，右=配置信息（v18.19 配置放右上角）
+        top = QHBoxLayout()
+        top.setSpacing(14)
+        live = QVBoxLayout()
+        live.setSpacing(1)
         self.lbl_w = QLabel("— W")
         self.lbl_w.setStyleSheet("color:#eef3ff; font-size:26px; font-weight:800;")
         self.lbl_sub = QLabel("监测中")
         self.lbl_sub.setStyleSheet("color:#9fb4d8; font-size:11px;")
+        live.addWidget(self.lbl_w)
+        live.addWidget(self.lbl_sub)
+        top.addLayout(live)
+        top.addStretch(1)
+        cfg = QVBoxLayout()
+        cfg.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        cfg.setSpacing(1)
+        self.lbl_cfg = QLabel("")
+        self.lbl_cfg.setStyleSheet("color:#9fb4d8; font-size:10px;")
+        self.lbl_cfg.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        cfg.addWidget(self.lbl_cfg)
+        top.addLayout(cfg)
+        root.addLayout(top)
+
+        # 电费行独占整行（v18.21 修复：原来挤在顶行左侧，被右侧配置列
+        # 压缩后「¥金额」被裁掉；独占一行 + 11px + 2 位小数保证 196px 内完整）
         self.lbl_cost = QLabel("")
-        self.lbl_cost.setStyleSheet("color:#ffd28a; font-size:12px; font-weight:600;")
-        self.lbl_bd = QLabel("")
-        self.lbl_bd.setStyleSheet("color:#b9cbe8; font-size:10px;")
-        self.lbl_bd.setWordWrap(True)
-        root.addWidget(self.lbl_w)
-        root.addWidget(self.lbl_sub)
+        self.lbl_cost.setStyleSheet("color:#ffd28a; font-size:11px; font-weight:600;")
         root.addWidget(self.lbl_cost)
-        root.addWidget(self.lbl_bd)
+
+        # 温度行（v18.24：CPU/GPU/硬盘实时温度，右对齐小字；无数据自动收起）
+        self.lbl_temp = QLabel("")
+        self.lbl_temp.setStyleSheet("color:#9fb4d8; font-size:9px;")
+        self.lbl_temp.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        root.addWidget(self.lbl_temp)
+
+        # 底部：完整功耗结构（v18.22 票据式两列小表——名称右对齐 + 瓦数右对齐
+        # 固定列，行由 set_breakdown 动态重建；末尾金色「合计」行）
+        self.bd_widget = QWidget()
+        self.bd_widget.setStyleSheet("background:transparent;")
+        bd = QVBoxLayout(self.bd_widget)
+        bd.setContentsMargins(0, 0, 0, 0)
+        bd.setSpacing(1)
+        bd.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        self.bd_rows = QVBoxLayout()
+        self.bd_rows.setContentsMargins(0, 0, 0, 0)
+        self.bd_rows.setSpacing(1)
+        bd.addLayout(self.bd_rows)
+        root.addWidget(self.bd_widget)
+        self._bd_row_widgets = []     # 当前行控件（重建时销毁，含末尾合计行）
+
         # 没有底板，给文字加黑色描边（offset=0 的阴影即形成轮廓），
         # 否则浅色壁纸上白色文字会完全看不见。
-        for _l in (self.lbl_w, self.lbl_sub, self.lbl_cost, self.lbl_bd):
+        for _l in (self.lbl_w, self.lbl_sub, self.lbl_cost, self.lbl_cfg, self.lbl_temp):
             _sh = QGraphicsDropShadowEffect(_l)
             _sh.setBlurRadius(8)
             _sh.setOffset(0, 0)
@@ -271,42 +337,58 @@ class MiniOverlay(QWidget):
         self._hide_cb = None       # 右键「隐藏」回调
         self._bd_cb = None         # 功耗构成显示开关回调
         # 尺寸随「是否显示功耗构成」变化，必须放在控件建好之后
-        self.lbl_bd.setVisible(self._show_bd)
+        self.bd_widget.setVisible(self._show_bd)
         self._apply_size()
 
     # ---------------- 功耗构成 ----------------
     def _apply_size(self):
-        """v18.18 宽度固定 224，高度随功耗构成内容自动伸缩。
+        """v18.22 宽度固定 240，高度随内容自动伸缩。
 
-        v18.17 是固定 224x128/104，只放得下一行构成小字；v18.18 改为
-        全面显示所有构成项（自动换行），高度按每行实际像素累加。
+        顶部：实时功率/状态（左）+ 配置信息（右）；
+        中部：电费整行；
+        底部：功耗结构票据式小表（每行名称+瓦数）+ 合计行。
+        高度按各块实际像素累加。
         """
-        self.setFixedWidth(224)
-        # 让换行计算基于真实行宽（224 - 左右边距 28）
-        self.lbl_bd.setFixedWidth(196)
+        self.setFixedWidth(240)                  # v18.21: 224→240，电费行需 198px
         h = 20                                   # 上下边距 10+10
-        for _l in (self.lbl_w, self.lbl_sub, self.lbl_cost):
-            h += _l.sizeHint().height() + 1      # 行高 + 间距
-        if self._show_bd and self.lbl_bd.text():
-            # 用 boundingRect 精确算换行后的高度（heightForWidth 在部分
-            # 环境/字体下返回 -1 或失真，不靠谱）
-            try:
-                _br = self.lbl_bd.fontMetrics().boundingRect(
-                    0, 0, 196, 100000,
-                    int(Qt.TextFlag.TextWordWrap), self.lbl_bd.text())
-                _bh = _br.height()
-            except Exception:
-                _bh = 12
-            h += max(12, _bh) + 1
-        self.setFixedHeight(max(104, h))
+        # 顶部块（左：功率/状态；右：配置）+ 电费整行 + 功耗构成
+        live_h = 0
+        for _l in (self.lbl_w, self.lbl_sub):
+            live_h += _l.sizeHint().height() + 1
+        cfg_h = self.lbl_cfg.sizeHint().height() if self.lbl_cfg.text() else 0
+        h += max(live_h, cfg_h) + 6             # 顶部块 + 与下方的间距
+        h += self.lbl_cost.sizeHint().height() + 1
+        if self.lbl_temp.text():
+            h += self.lbl_temp.sizeHint().height() + 1
+        if self._show_bd and self._bd_row_widgets:
+            for _w in self._bd_row_widgets:
+                h += _w.sizeHint().height() + 1
+        self.setFixedHeight(max(120, h))
+        # v18.23 内容变高后（票据式表格比旧文本高），历史位置可能把窗口
+        # 底部顶出屏幕——每次尺寸变化后钳制回屏内
+        self._clamp_into_screen()
+
+    def _clamp_into_screen(self):
+        """v18.23 把悬浮窗钳制回所在屏幕的可用区域（不压任务栏）。"""
+        try:
+            scr = self.screen() or QApplication.primaryScreen()
+            if scr is None:
+                return
+            g = scr.availableGeometry()
+            x = min(max(self.x(), g.left()), g.right() - self.width())
+            y = min(max(self.y(), g.top()), g.bottom() - self.height())
+            if (x, y) != (self.x(), self.y()):
+                self.move(x, y)
+        except Exception:
+            pass
 
     def bd_visible(self) -> bool:
         return bool(self._show_bd)
 
     def set_bd_visible(self, on: bool, notify: bool = True):
-        """开关功耗构成行（右键菜单 / 会话恢复共用）。"""
+        """开关功耗构成小表（右键菜单 / 会话恢复共用）。"""
         self._show_bd = bool(on)
-        self.lbl_bd.setVisible(self._show_bd)
+        self.bd_widget.setVisible(self._show_bd)
         self._apply_size()
         if notify and callable(self._bd_cb):
             try:
@@ -314,20 +396,81 @@ class MiniOverlay(QWidget):
             except Exception:
                 pass
 
+    def _bd_row(self, name: str, watts: float, total: bool = False):
+        """v18.22 票据式一行：名称（右对齐）+ 瓦数（右对齐固定列）。"""
+        row = QWidget()
+        row.setStyleSheet("background:transparent;")
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        ln = QLabel(name)
+        ln.setStyleSheet("color:%s; font-size:10px;%s" % (
+            "#ffd28a" if total else "#b9cbe8",
+            " font-weight:700;" if total else ""))
+        ln.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        lv = QLabel("%.0f W" % watts)
+        lv.setStyleSheet("color:%s; font-size:10px;%s" % (
+            "#ffd28a" if total else "#eef3ff",
+            " font-weight:700;" if total else ""))
+        lv.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        lv.setFixedWidth(52)
+        lay.addWidget(ln, 1)
+        lay.addWidget(lv, 0)
+        # 行内文字同样加黑描边（无底板，浅色壁纸可见）
+        for _l in (ln, lv):
+            _sh = QGraphicsDropShadowEffect(_l)
+            _sh.setBlurRadius(8)
+            _sh.setOffset(0, 0)
+            _sh.setColor(QColor(0, 0, 0, 235))
+            _l.setGraphicsEffect(_sh)
+        return row
+
     def set_breakdown(self, bd: dict):
-        """v18.18 全面功耗构成：所有构成项全部列出，按功耗降序，自动换行。"""
+        """v18.22 票据式功耗结构：全部项按功耗降序逐行两列对齐，末尾合计行。"""
         try:
             items = sorted(((str(k), float(v)) for k, v in (bd or {}).items()),
                            key=lambda kv: -kv[1])
             items = [(k, v) for k, v in items if v > 0.05]
-            if items:
-                self.lbl_bd.setText(" · ".join("%s %.0f" % (k, v)
-                                               for k, v in items) + " W")
-            else:
-                self.lbl_bd.setText("")
         except Exception:
-            self.lbl_bd.setText("")
+            items = []
+        # 清空旧行
+        while self._bd_row_widgets:
+            _w = self._bd_row_widgets.pop()
+            self.bd_rows.removeWidget(_w)
+            _w.deleteLater()
+        if items:
+            for k, v in items:
+                _row = self._bd_row(k, v)
+                self.bd_rows.addWidget(_row)
+                self._bd_row_widgets.append(_row)
+            _row = self._bd_row("合计", sum(v for _, v in items), total=True)
+            self.bd_rows.addWidget(_row)
+            self._bd_row_widgets.append(_row)
         self._apply_size()
+
+    def set_config(self, cfg_lines):
+        """v18.19 右上角配置信息（多行小字，右对齐）。空内容自动收起。"""
+        try:
+            txt = "\n".join(str(x) for x in (cfg_lines or []) if str(x).strip())
+        except Exception:
+            txt = ""
+        self.lbl_cfg.setText(txt)
+        self._apply_size()
+
+    def place_right(self):
+        """v18.19 默认定位：整个悬浮窗落在屏幕右侧 15% 区域内（水平居中于该区、垂直居中）。
+
+        只在「无历史拖动位置」时作为初始位置使用；用户拖动后由会话记忆接管。
+        """
+        try:
+            scr = self.screen() or QApplication.primaryScreen()
+            g = scr.availableGeometry()
+            band = max(int(g.width() * 0.15), self.width() + 20)
+            x = g.right() - band + (band - self.width()) // 2
+            y = g.top() + (g.height() - self.height()) // 2
+            self.move(x, y)
+        except Exception:
+            pass
 
     # ---------------- 层级模式 ----------------
     @staticmethod
@@ -372,6 +515,7 @@ class MiniOverlay(QWidget):
         act_bd = menu.addAction("显示功耗构成（全部项）")
         act_bd.setCheckable(True)
         act_bd.setChecked(self._show_bd)
+        act_home = menu.addAction("恢复默认位置（屏幕右侧）")   # v18.20
         menu.addSeparator()
         act_hide = menu.addAction("隐藏悬浮窗")
         chosen = menu.exec(ev.globalPos())
@@ -381,6 +525,9 @@ class MiniOverlay(QWidget):
             self.set_layer(False)
         elif chosen == act_bd:
             self.set_bd_visible(not self._show_bd)
+        elif chosen == act_home:
+            # v18.20 一键回到默认位置（屏幕右侧 15% 区带、垂直居中）
+            self.place_right()
         elif chosen == act_hide:
             if callable(self._hide_cb):
                 try:
@@ -531,6 +678,9 @@ class MainWindow(QMainWindow):
         if self._mini_visible:
             if self._mini_pos:
                 self.mini.move(int(self._mini_pos[0]), int(self._mini_pos[1]))
+            else:
+                # v18.19 无历史位置：默认整个落在屏幕右侧 15% 区域
+                self.mini.place_right()
             self.mini.show()
             if self.tray is not None and getattr(self, "a_mini", None) is not None:
                 self.a_mini.setChecked(True)
@@ -2897,10 +3047,41 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
             cost = self._current_cost()
         except Exception:
             cost = 0.0
-        m.lbl_cost.setText(f"本轮 {self.energy_wh/1000.0:.3f} kWh · ¥{cost:,.2f}")
+        # v18.21：去掉「本轮 」前缀——196px 窗宽内放不下全量文本，金额会被裁；
+        # 累计量大时（≥100kWh）降精度，保证长年运行也不超宽
+        kwh = self.energy_wh / 1000.0
+        if kwh >= 100:
+            m.lbl_cost.setText(f"{kwh:.1f} kWh · ¥{cost:.0f}")
+        else:
+            m.lbl_cost.setText(f"{kwh:.2f} kWh · ¥{cost:,.2f}")
+        # v18.24 温度行：CPU/GPU/硬盘（来自采样 sys；缺失时整行收起）
+        try:
+            sy = getattr(self, "_sys_dyn", None) or {}
+            parts = []
+            ct = sy.get("cpu_temp")
+            if ct:
+                parts.append("CPU %d°" % round(ct))
+            gt = sy.get("gpu_temp")
+            if gt:
+                parts.append("GPU %d°" % round(gt))
+            dts = sy.get("disk_temps") or {}
+            for i, (_k, t) in enumerate(sorted(dts.items())[:2]):
+                if t:
+                    parts.append(("盘%d %d°" % (i + 1, round(t))) if i else ("盘 %d°" % round(t)))
+            m.lbl_temp.setText(" ".join(parts))
+        except Exception:
+            m.lbl_temp.setText("")
+        m._apply_size()
         # v18.17 第四行：功耗构成
         try:
             m.set_breakdown((self.cur or {}).get("breakdown") or {})
+        except Exception:
+            pass
+        # v18.19 右上角配置信息（硬件概要，取自启动时检测的本机配置）
+        try:
+            if not getattr(self, "_mini_cfg_set", False):
+                m.set_config(_cfg_compact(self.hw))
+                self._mini_cfg_set = True
         except Exception:
             pass
 
@@ -2933,6 +3114,9 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         if on:
             if self._mini_pos:
                 self.mini.move(int(self._mini_pos[0]), int(self._mini_pos[1]))
+            else:
+                # v18.19 无历史位置：默认整个落在屏幕右侧 15% 区域
+                self.mini.place_right()
             self._update_mini()
             self.mini.show()
         else:
