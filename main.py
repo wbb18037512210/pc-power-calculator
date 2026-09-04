@@ -42,7 +42,7 @@ import hardware as H
 import power_model as PM
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.16"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.17"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 2000
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -129,7 +129,7 @@ CSS = """
 QMainWindow { background: #f4f6f9; }
 QWidget#card { background: #ffffff; border-radius: 12px; border: 1px solid #e6e9ef; }
 QLabel#title { font-size: 13px; color: #8a93a6; }
-QLabel#big { font-size: 34px; font-weight: 700; color: #1f2a44; }
+QLabel#big { font-size: 28px; font-weight: 700; color: #1f2a44; }
 QLabel#sub { font-size: 12px; color: #8a93a6; }
 QLabel#hw { font-size: 13px; color: #2b3552; }
 QPushButton {
@@ -235,12 +235,12 @@ class MiniOverlay(QWidget):
     背景全透明：不画底板只显示文字，靠黑色描边保证深浅壁纸上都看得清。
     v18.13 起取消双击隐藏（v18.8 行为），避免拖动时误触把窗口弄丢。
     """
-    def __init__(self, on_top: bool = False):
+    def __init__(self, on_top: bool = False, show_bd: bool = True):
         super().__init__(None)
         self._on_top = bool(on_top)
+        self._show_bd = bool(show_bd)
         self.setWindowFlags(self._flags_for(self._on_top))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(196, 104)
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 10, 14, 10)
         root.setSpacing(1)
@@ -250,12 +250,16 @@ class MiniOverlay(QWidget):
         self.lbl_sub.setStyleSheet("color:#9fb4d8; font-size:11px;")
         self.lbl_cost = QLabel("")
         self.lbl_cost.setStyleSheet("color:#ffd28a; font-size:12px; font-weight:600;")
+        self.lbl_bd = QLabel("")
+        self.lbl_bd.setStyleSheet("color:#b9cbe8; font-size:10px;")
+        self.lbl_bd.setWordWrap(True)
         root.addWidget(self.lbl_w)
         root.addWidget(self.lbl_sub)
         root.addWidget(self.lbl_cost)
+        root.addWidget(self.lbl_bd)
         # 没有底板，给文字加黑色描边（offset=0 的阴影即形成轮廓），
         # 否则浅色壁纸上白色文字会完全看不见。
-        for _l in (self.lbl_w, self.lbl_sub, self.lbl_cost):
+        for _l in (self.lbl_w, self.lbl_sub, self.lbl_cost, self.lbl_bd):
             _sh = QGraphicsDropShadowEffect(_l)
             _sh.setBlurRadius(8)
             _sh.setOffset(0, 0)
@@ -265,6 +269,46 @@ class MiniOverlay(QWidget):
         self._drag = None
         self._layer_cb = None      # 层级切换回调（主窗口用来写会话）
         self._hide_cb = None       # 右键「隐藏」回调
+        self._bd_cb = None         # 功耗构成显示开关回调
+        # 尺寸随「是否显示功耗构成」变化，必须放在控件建好之后
+        self.lbl_bd.setVisible(self._show_bd)
+        self._apply_size()
+
+    # ---------------- 功耗构成 ----------------
+    def _apply_size(self):
+        """显示功耗构成时加高一点，容纳那行小字。"""
+        self.setFixedSize(224, 128 if self._show_bd else 104)
+
+    def bd_visible(self) -> bool:
+        return bool(self._show_bd)
+
+    def set_bd_visible(self, on: bool, notify: bool = True):
+        """开关功耗构成行（右键菜单 / 会话恢复共用）。"""
+        self._show_bd = bool(on)
+        self.lbl_bd.setVisible(self._show_bd)
+        self._apply_size()
+        if notify and callable(self._bd_cb):
+            try:
+                self._bd_cb(self._show_bd)
+            except Exception:
+                pass
+
+    def set_breakdown(self, bd: dict, max_items: int = 4):
+        """把功耗构成压成一行小字：按功耗降序取前 N 项，其余归进「其他」。"""
+        try:
+            items = sorted(((str(k), float(v)) for k, v in (bd or {}).items()),
+                           key=lambda kv: -kv[1])
+            items = [(k, v) for k, v in items if v > 0.05]
+            if not items:
+                self.lbl_bd.setText("")
+                return
+            top, rest = items[:max_items], items[max_items:]
+            parts = ["%s %.0f" % (k, v) for k, v in top]
+            if rest:
+                parts.append("其他 %.0f" % sum(v for _, v in rest))
+            self.lbl_bd.setText(" · ".join(parts) + " W")
+        except Exception:
+            self.lbl_bd.setText("")
 
     # ---------------- 层级模式 ----------------
     @staticmethod
@@ -306,12 +350,18 @@ class MiniOverlay(QWidget):
         act_bot.setCheckable(True)
         act_bot.setChecked(not self._on_top)
         menu.addSeparator()
+        act_bd = menu.addAction("显示功耗构成")
+        act_bd.setCheckable(True)
+        act_bd.setChecked(self._show_bd)
+        menu.addSeparator()
         act_hide = menu.addAction("隐藏悬浮窗")
         chosen = menu.exec(ev.globalPos())
         if chosen == act_top:
             self.set_layer(True)
         elif chosen == act_bot:
             self.set_layer(False)
+        elif chosen == act_bd:
+            self.set_bd_visible(not self._show_bd)
         elif chosen == act_hide:
             if callable(self._hide_cb):
                 try:
@@ -337,7 +387,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"PC 电脑用电电费计算器 {APP_VERSION}")
-        self.resize(1080, 760)
+        self.resize(1080, 880)  # v18.17 收窄主界面（此前被内容顶到 1983px，最小 944）
         self.setStyleSheet(CSS)
 
         # ---- 状态 ----
@@ -361,6 +411,8 @@ class MainWindow(QMainWindow):
         self._mini_pos = None
         # v18.15 悬浮窗层级：True=始终置顶，False=嵌入桌面（置底）
         self._mini_on_top = False
+        # v18.17 悬浮窗是否显示功耗构成行
+        self._mini_bd = True
         # v18.9 每日日报：跨天检测锚点（首拍落今日，跨零点自动出前一日日报）
         self._last_date = None
         # 计费方式：单一 / 峰谷 / 阶梯
@@ -454,7 +506,8 @@ class MainWindow(QMainWindow):
             pass
         self._setup_tray()
         # v18.8 迷你悬浮窗：按会话恢复显示与位置
-        self.mini = MiniOverlay(on_top=getattr(self, '_mini_on_top', False))
+        self.mini = MiniOverlay(on_top=getattr(self, '_mini_on_top', False),
+                            show_bd=getattr(self, '_mini_bd', True))
         self.mini.hide()
         if self._mini_visible:
             if self._mini_pos:
@@ -504,8 +557,12 @@ class MainWindow(QMainWindow):
         t = QLabel("⚡ PC 用电电费计算器")
         t.setFont(QFont("Microsoft YaHei", 18, QFont.Weight.Bold))
         t.setStyleSheet("color:#1f2a44;")
-        sub = QLabel(f"实时监测 · 24 小时汇总 · 完全离线 · {APP_VERSION}")
+        sub = QLabel(f"实时监测 · 24 小时汇总 · {APP_VERSION}")
         sub.setStyleSheet("color:#8a93a6;font-size:12px;")
+        # v18.17 允许被压缩：QLabel 默认最小宽度=整段文本宽度，
+        # 这行副标题有 662px，是标题行撑宽主界面的主要原因
+        sub.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        sub.setMinimumWidth(0)
         top.addWidget(t)
         top.addItem(QSpacerItem(20, 10, QSizePolicy.Expanding))
         top.addWidget(sub)
@@ -560,17 +617,22 @@ class MainWindow(QMainWindow):
 
     def _live_card(self) -> QWidget:
         c = QWidget(); self._card(c)
-        lay = QHBoxLayout(c); lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(18)
+        # v18.17 外层竖排：7 个指标一行 + 详解行独占一整行。
+        # 之前详解行（"直流 X W + 电源损耗 Y W = 插座 Z W（效率…）"）夹在第一列里，
+        # 它是最长的文本，直接把这张卡片的最小宽度顶到 1572px，
+        # 主界面被连带撑到 1983px（resize(1080) 形同虚设）。挪出来就好了。
+        outer = QVBoxLayout(c); outer.setContentsMargins(16, 14, 16, 14)
+        outer.setSpacing(8)
+        # 4 列 x 2 行：7 个指标排一行时，光是大号数字就占掉约 1226px，
+        # 主界面被迫跟着变宽。分两行后最小宽度约为 4 个指标。
+        grid = QGridLayout(); grid.setHorizontalSpacing(16); grid.setVerticalSpacing(10)
+        outer.addLayout(grid)
 
         # 插座功耗（大）
         col1 = QVBoxLayout(); col1.setSpacing(2)
         col1.addWidget(self._lbl("插座实时功耗", "title"))
         self.wall_big = self._lbl("0.0 W", "big")
         col1.addWidget(self.wall_big)
-        self.wall_sub = self._lbl("直流 0.0 W + 电源损耗 0.0 W = 插座 0.0 W（效率 0.85）", "sub")
-        col1.addWidget(self.wall_sub)
-        lay.addLayout(col1, 2)
 
         # 累计电量
         col2 = QVBoxLayout(); col2.setSpacing(2)
@@ -579,7 +641,6 @@ class MainWindow(QMainWindow):
         col2.addWidget(self.energy_big)
         self.cost_sub = self._lbl("电费 ¥0.00", "sub")
         col2.addWidget(self.cost_sub)
-        lay.addLayout(col2, 2)
 
         # 倒计时
         col3 = QVBoxLayout(); col3.setSpacing(2)
@@ -591,7 +652,6 @@ class MainWindow(QMainWindow):
         self.rate_sub.setToolTip("点击直接修改每度电价格（峰谷/阶梯计费在「设置」里调整）")
         self.rate_sub.installEventFilter(self)
         col3.addWidget(self.rate_sub)
-        lay.addLayout(col3, 2)
 
         # CPU/GPU 负载
         col4 = QVBoxLayout(); col4.setSpacing(2)
@@ -601,7 +661,6 @@ class MainWindow(QMainWindow):
         col4.addWidget(self.cpu_lbl); col4.addWidget(self.gpu_lbl)
         self.psu_lbl = self._lbl("", "sub")
         col4.addWidget(self.psu_lbl)
-        lay.addLayout(col4, 2)
 
         # 预估电费（每小时 / 每24小时 / 每月）
         col5 = QVBoxLayout(); col5.setSpacing(3)
@@ -615,7 +674,6 @@ class MainWindow(QMainWindow):
             cap_lbl = self._lbl(cap, "sub"); cap_lbl.setMinimumWidth(60)
             row.addWidget(cap_lbl); row.addWidget(w, 1)
             col5.addLayout(row); self._proj_rows.append(row)
-        lay.addLayout(col5, 2)
 
         # 月度预算进度
         col6 = QVBoxLayout(); col6.setSpacing(2)
@@ -632,7 +690,6 @@ class MainWindow(QMainWindow):
         col6.addWidget(self.budget_bar)
         self.budget_sub = self._lbl("", "sub")
         col6.addWidget(self.budget_sub)
-        lay.addLayout(col6, 2)
 
         # 待机占比
         col7 = QVBoxLayout(); col7.setSpacing(2)
@@ -641,7 +698,24 @@ class MainWindow(QMainWindow):
         col7.addWidget(self.idle_big)
         self.idle_sub = self._lbl("空闲时段耗电", "sub")
         col7.addWidget(self.idle_sub)
-        lay.addLayout(col7, 2)
+
+        # 详解行独占整行：最长的一句，给它完整宽度，避免撑宽上面 7 列
+        self.wall_sub = self._lbl(
+            "直流 0.0 W + 电源损耗 0.0 W = 插座 0.0 W（效率 0.85）", "sub")
+        self.wall_sub.setWordWrap(True)
+        self.wall_sub.setMinimumWidth(0)
+        outer.addWidget(self.wall_sub)
+
+        for _i, _col in enumerate((col1, col2, col3, col4, col5, col6, col7)):
+            grid.addLayout(_col, _i // 4, _i % 4)
+
+        # v18.17 QLabel 默认「最小宽度 = 整段文本宽度」。填上真实数据后
+        # （如 "1,234.5 W"、"23:59:59"）各列会互相顶宽，卡片最小宽度从
+        # 空态 792px 涨到 1232px，主界面又被撑开。改为可压缩：
+        # 窄窗口下宁可让文字截断，也不要把窗口顶宽。
+        for _lb in c.findChildren(QLabel):
+            _lb.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            _lb.setMinimumWidth(0)
 
         return c
 
@@ -674,6 +748,9 @@ class MainWindow(QMainWindow):
         self._chart_max_bucket = -1        # y 轴量程变化去抖
         self.chart_view = QChartView(self.chart)
         self.chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # v18.17 QChartView 自带较大的最小尺寸，是「中间一行」顶宽主界面的主因
+        self.chart_view.setMinimumWidth(0)
+        self.chart_view.setMinimumHeight(120)
         lay.addWidget(self.chart_view, 1)
         return c
 
@@ -695,12 +772,17 @@ class MainWindow(QMainWindow):
         self.psu_hint = QLabel("")
         self.psu_hint.setStyleSheet("font-size:12px;color:#6b7488;")
         lay.addWidget(self.psu_hint)
+        # v18.17 同实时卡片：表格/提示的最小宽度不再反向顶宽主界面
+        self.table.setMinimumWidth(0)
+        for _lb in c.findChildren(QLabel):
+            _lb.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            _lb.setMinimumWidth(0)
         return c
 
     # ---------------- 系统信息侧栏（AIDA64 风格，最左侧） ----------------
     def _sysinfo_panel(self) -> QWidget:
         c = QWidget()
-        c.setFixedWidth(375)
+        c.setFixedWidth(288)   # v18.17 收窄：主界面整体变窄
         c.setStyleSheet("background:#ffffff;border-right:1px solid #e6e9ef;")
         v = QVBoxLayout(c); v.setContentsMargins(8, 8, 8, 8); v.setSpacing(0)
         self.sysinfo_view = QTextBrowser()
@@ -963,11 +1045,18 @@ class MainWindow(QMainWindow):
         self.btn_settings = QPushButton("设置"); self.btn_settings.setObjectName("ghost")
         self.btn_settings.clicked.connect(self.open_settings)
         self.status_lbl = QLabel("就绪"); self.status_lbl.setStyleSheet("color:#6b7488;font-size:12px;")
-        lay.addWidget(self.btn_reset)
-        lay.addWidget(self.btn_export); lay.addWidget(self.btn_csv)
         self.btn_apps = QPushButton("软件耗电"); self.btn_apps.setObjectName("ghost")
         self.btn_apps.clicked.connect(self.open_apps)
-        lay.addWidget(self.btn_compare); lay.addWidget(self.btn_history); lay.addWidget(self.btn_sim); lay.addWidget(self.btn_hourly); lay.addWidget(self.btn_apps); lay.addWidget(self.btn_settings)
+        # v18.17 两行排布：9 个按钮挤在一行会把控制条最小宽度顶到 1020px。
+        # 改成每行 5 个的网格后，最小宽度降到约 5 个按钮，主界面才能收窄。
+        grid = QGridLayout(); grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8); grid.setVerticalSpacing(8)
+        _btns = (self.btn_reset, self.btn_export, self.btn_csv, self.btn_compare,
+                 self.btn_history, self.btn_sim, self.btn_hourly, self.btn_apps,
+                 self.btn_settings)
+        for _i, _b in enumerate(_btns):
+            grid.addWidget(_b, _i // 4, _i % 4)
+        lay.addLayout(grid)
         lay.addItem(QSpacerItem(20, 10, QSizePolicy.Expanding))
         lay.addWidget(self.status_lbl)
         return c
@@ -2044,12 +2133,25 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
             _vis = "显示中" if (_m is not None and _m.isVisible()) else "已隐藏"
             _dock = ("始终置顶" if (_m is not None and _m.layer_on_top())
                      else "嵌入桌面（置底）")
+            _mbd = ""
+            if _m is not None and _m.bd_visible():
+                _bd = (self.cur or {}).get("breakdown") or {}
+                _its = sorted(((str(_k), float(_v)) for _k, _v in _bd.items()),
+                              key=lambda _kv: -_kv[1])
+                _its = [(k, v) for k, v in _its if v > 0.05]
+                if _its:
+                    _top, _rest = _its[:4], _its[4:]
+                    _ps = ["%s %.0f" % (k, v) for k, v in _top]
+                    if _rest:
+                        _ps.append("其他 %.0f" % sum(v for _, v in _rest))
+                    _mbd = " · ".join(_ps) + " W"
             mini_block = (
                 f"<div class='card'><div class='k'>迷你悬浮窗（导出瞬间快照）</div>"
                 f"<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
                 f"<tr><td>第一行 · 瞬时插座功耗</td><td style='text-align:right'>{_mw}</td></tr>"
                 f"<tr><td>第二行 · 监测状态</td><td style='text-align:right'>{_ms} · 显示器{_disp}</td></tr>"
                 f"<tr><td>第三行 · 本轮累计</td><td style='text-align:right'>{_mc}</td></tr>"
+                f"<tr><td>第四行 · 功耗构成</td><td style='text-align:right'>{_mbd}</td></tr>"
                 f"<tr><td>插座 / 直流系统功耗</td><td style='text-align:right'>{_wall:.1f} W / {_sys:.1f} W</td></tr>"
                 f"<tr><td>电源效率</td><td style='text-align:right'>{_eff:.2f} {_dyn}</td></tr>"
                 f"<tr><td>显示器功耗 / 累计节省</td>"
@@ -2283,6 +2385,9 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 "mini_on_top": (self.mini.layer_on_top()
                                 if getattr(self, "mini", None) is not None
                                 else getattr(self, "_mini_on_top", False)),
+                "mini_bd": (self.mini.bd_visible()
+                            if getattr(self, "mini", None) is not None
+                            else getattr(self, "_mini_bd", True)),
                 # v18.11 显示器状态与熄屏省电累计
                 "disp_manual": self._disp_manual,
                 "disp_saved_wh": self._disp_saved_wh,
@@ -2365,6 +2470,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         self._disp_manual = dm if isinstance(dm, bool) else None
         self._disp_saved_wh = float(d.get("disp_saved_wh", 0.0) or 0.0)
         self._mini_on_top = bool(d.get("mini_on_top", False))
+        self._mini_bd = bool(d.get("mini_bd", True))
         mp = d.get("mini_pos")
         if isinstance(mp, (list, tuple)) and len(mp) == 2:
             try:
@@ -2773,6 +2879,11 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         except Exception:
             cost = 0.0
         m.lbl_cost.setText(f"本轮 {self.energy_wh/1000.0:.3f} kWh · ¥{cost:,.2f}")
+        # v18.17 第四行：功耗构成
+        try:
+            m.set_breakdown((self.cur or {}).get("breakdown") or {})
+        except Exception:
+            pass
 
     def _on_mini_layer(self, on_top: bool):
         """悬浮窗层级被右键切换：记录下来并立即落盘，下次启动保持。"""
@@ -2782,14 +2893,24 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         except Exception:
             pass
 
+    def _on_mini_bd(self, on: bool):
+        """悬浮窗「功耗构成」开关被右键切换：记录并落盘。"""
+        self._mini_bd = bool(on)
+        try:
+            self._save_session()
+        except Exception:
+            pass
+
     def _toggle_mini(self, on: bool):
         """v18.8 开关迷你悬浮窗（托盘菜单/设置面板/会话恢复共用）。"""
         self._mini_visible = bool(on)
         if self.mini is None:
-            self.mini = MiniOverlay(on_top=getattr(self, '_mini_on_top', False))
+            self.mini = MiniOverlay(on_top=getattr(self, '_mini_on_top', False),
+                            show_bd=getattr(self, '_mini_bd', True))
             # 右键切层级 / 右键隐藏 都回落到主窗口，便于同步设置与落盘
             self.mini._layer_cb = self._on_mini_layer
             self.mini._hide_cb = lambda: self._toggle_mini(False)
+            self.mini._bd_cb = self._on_mini_bd
         if on:
             if self._mini_pos:
                 self.mini.move(int(self._mini_pos[0]), int(self._mini_pos[1]))

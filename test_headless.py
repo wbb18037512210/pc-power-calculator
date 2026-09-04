@@ -529,6 +529,40 @@ w.mini._layer_cb = None
 w.mini.hide()
 print("mini overlay v18.15 OK | 无底板 无双击隐藏 | 层级可切(置底/置顶) 切换后仍可见")
 
+# ---- v18.17 悬浮窗第四行：功耗构成 ----
+_m = w.mini
+assert _m.bd_visible() is True, "默认应显示功耗构成"
+_h0 = _m.height()
+_m.set_breakdown({"CPU": 45.2, "GPU": 82.7, "显示器": 30.0,
+                  "主板": 18.4, "内存": 6.1, "HDD": 8.5})
+_txt = _m.lbl_bd.text()
+assert "GPU 83" in _txt and "CPU 45" in _txt, _txt
+assert "显示器 30" in _txt, _txt
+assert "其他" in _txt, "超过 4 项应归并到「其他」: %s" % _txt
+assert _txt.endswith(" W"), _txt
+# 关掉：控件隐藏 + 高度变小；再打开恢复
+_m.set_bd_visible(False)
+assert _m.bd_visible() is False and not _m.lbl_bd.isVisible()
+assert _m.height() < _h0, (_m.height(), _h0)
+_m.set_bd_visible(True)
+assert _m.bd_visible() is True and _m.height() == _h0, (_m.height(), _h0)
+# 空数据 / None 都不该崩，且清空文本
+_m.set_breakdown({})
+assert _m.lbl_bd.text() == "", _m.lbl_bd.text()
+_m.set_breakdown(None)
+assert _m.lbl_bd.text() == ""
+print("mini breakdown OK |", _txt)
+
+# ---- v18.17 主界面宽度：此前被内容顶到 1983px，resize() 形同虚设 ----
+w.resize(1120, 820)
+app.processEvents()
+_mw = w.minimumSizeHint().width()
+w.resize(1080, 880)
+app.processEvents()
+_mw = w.minimumSizeHint().width()
+assert w.width() <= 1100, "实际宽度 %d px 没按 resize 生效" % w.width()
+print("main window width OK | minimumHint=%d 实际=%d（修复前 1983）" % (_mw, w.width()))
+
 # v18.9 回归：每日日报（小时桶汇总 → HTML 落盘）+ 跨天自动触发
 w.price_mode = "单一"; w.rate = 0.56
 w.hourly["2026-09-02 08:00"] = [400.0 * 2, 2]   # 均 400W → 0.4 kWh
