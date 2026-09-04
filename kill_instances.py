@@ -12,16 +12,41 @@ from __future__ import annotations
 
 import sys
 
-TARGETS = ("PC用电电费计算器.exe", "PC电费_debug.exe")
+TARGETS = ("PC用电电费计算器", "PC电费_debug")   # 前缀匹配：产物带版本号也能杀到
+
+
+def _running_names() -> list[str]:
+    """tasklist 列出进程名，返回命中前缀的完整镜像名（如 PC用电电费计算器_v18.17.exe）。"""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, timeout=20,
+            encoding="gbk", errors="replace",
+            creationflags=0x08000000,
+        )
+    except Exception:
+        return []
+    names = []
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith('"'):
+            continue
+        try:
+            name = line.split('","')[0].strip('"')
+        except Exception:
+            continue
+        if any(name.startswith(p) for p in TARGETS) and name not in names:
+            names.append(name)
+    return names
 
 
 def kill() -> int:
-    try:
-        import subprocess
-    except Exception:
-        return 0
+    import subprocess
     killed = 0
-    for name in TARGETS:
+    # 先按镜像名精确杀（覆盖无版本号的旧命名），再按前缀枚举杀（覆盖带版本号的新命名）
+    names = list(TARGETS) + [n for n in _running_names() if n not in TARGETS]
+    for name in names:
         try:
             r = subprocess.run(
                 ["taskkill", "/F", "/IM", name],

@@ -529,29 +529,36 @@ w.mini._layer_cb = None
 w.mini.hide()
 print("mini overlay v18.15 OK | 无底板 无双击隐藏 | 层级可切(置底/置顶) 切换后仍可见")
 
-# ---- v18.17 悬浮窗第四行：功耗构成 ----
+# ---- v18.18 悬浮窗：全面功耗构成（全部项，自动换行，高度自适应） ----
 _m = w.mini
 assert _m.bd_visible() is True, "默认应显示功耗构成"
-_h0 = _m.height()
+_m.set_bd_visible(False)
+_h0 = _m.height()          # 不显示构成时的基准高度
+_m.set_bd_visible(True)
+_h1 = _m.height()
+# 注意：前面 w._update_mini() 已把构成行填了真实数据，所以开着构成应比关着高
+assert _h1 > _h0, (_h0, _h1)
 _m.set_breakdown({"CPU": 45.2, "GPU": 82.7, "显示器": 30.0,
-                  "主板": 18.4, "内存": 6.1, "HDD": 8.5})
+                  "主板": 18.4, "内存": 6.1, "HDD": 8.5, "SSD": 3.2})
 _txt = _m.lbl_bd.text()
-assert "GPU 83" in _txt and "CPU 45" in _txt, _txt
-assert "显示器 30" in _txt, _txt
-assert "其他" in _txt, "超过 4 项应归并到「其他」: %s" % _txt
+for _frag in ("GPU 83", "CPU 45", "显示器 30", "主板 18", "内存 6", "HDD 8", "SSD 3"):
+    assert _frag in _txt, (_frag, _txt)
+assert "其他" not in _txt, "v18.18 起全部列出，不应再归并「其他」: %s" % _txt
 assert _txt.endswith(" W"), _txt
-# 关掉：控件隐藏 + 高度变小；再打开恢复
+app.processEvents()
+assert _m.height() >= _h1, "全量构成后高度不应缩小: %s vs %s" % (_m.height(), _h1)
+assert _m.width() == 224, _m.width()
+# 关掉：控件隐藏 + 高度回到基准；再打开恢复显示
 _m.set_bd_visible(False)
 assert _m.bd_visible() is False and not _m.lbl_bd.isVisible()
-assert _m.height() < _h0, (_m.height(), _h0)
 _m.set_bd_visible(True)
-assert _m.bd_visible() is True and _m.height() == _h0, (_m.height(), _h0)
+assert _m.bd_visible() is True
 # 空数据 / None 都不该崩，且清空文本
 _m.set_breakdown({})
 assert _m.lbl_bd.text() == "", _m.lbl_bd.text()
 _m.set_breakdown(None)
 assert _m.lbl_bd.text() == ""
-print("mini breakdown OK |", _txt)
+print("mini breakdown full OK | 高度 %d -> %d（全量 %d 项）" % (_h0, _m.height(), 7))
 
 # ---- v18.17 主界面宽度：此前被内容顶到 1983px，resize() 形同虚设 ----
 w.resize(1120, 820)

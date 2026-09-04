@@ -42,7 +42,7 @@ import hardware as H
 import power_model as PM
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.17"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.18"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 2000
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -276,8 +276,29 @@ class MiniOverlay(QWidget):
 
     # ---------------- 功耗构成 ----------------
     def _apply_size(self):
-        """显示功耗构成时加高一点，容纳那行小字。"""
-        self.setFixedSize(224, 128 if self._show_bd else 104)
+        """v18.18 宽度固定 224，高度随功耗构成内容自动伸缩。
+
+        v18.17 是固定 224x128/104，只放得下一行构成小字；v18.18 改为
+        全面显示所有构成项（自动换行），高度按每行实际像素累加。
+        """
+        self.setFixedWidth(224)
+        # 让换行计算基于真实行宽（224 - 左右边距 28）
+        self.lbl_bd.setFixedWidth(196)
+        h = 20                                   # 上下边距 10+10
+        for _l in (self.lbl_w, self.lbl_sub, self.lbl_cost):
+            h += _l.sizeHint().height() + 1      # 行高 + 间距
+        if self._show_bd and self.lbl_bd.text():
+            # 用 boundingRect 精确算换行后的高度（heightForWidth 在部分
+            # 环境/字体下返回 -1 或失真，不靠谱）
+            try:
+                _br = self.lbl_bd.fontMetrics().boundingRect(
+                    0, 0, 196, 100000,
+                    int(Qt.TextFlag.TextWordWrap), self.lbl_bd.text())
+                _bh = _br.height()
+            except Exception:
+                _bh = 12
+            h += max(12, _bh) + 1
+        self.setFixedHeight(max(104, h))
 
     def bd_visible(self) -> bool:
         return bool(self._show_bd)
@@ -293,22 +314,20 @@ class MiniOverlay(QWidget):
             except Exception:
                 pass
 
-    def set_breakdown(self, bd: dict, max_items: int = 4):
-        """把功耗构成压成一行小字：按功耗降序取前 N 项，其余归进「其他」。"""
+    def set_breakdown(self, bd: dict):
+        """v18.18 全面功耗构成：所有构成项全部列出，按功耗降序，自动换行。"""
         try:
             items = sorted(((str(k), float(v)) for k, v in (bd or {}).items()),
                            key=lambda kv: -kv[1])
             items = [(k, v) for k, v in items if v > 0.05]
-            if not items:
+            if items:
+                self.lbl_bd.setText(" · ".join("%s %.0f" % (k, v)
+                                               for k, v in items) + " W")
+            else:
                 self.lbl_bd.setText("")
-                return
-            top, rest = items[:max_items], items[max_items:]
-            parts = ["%s %.0f" % (k, v) for k, v in top]
-            if rest:
-                parts.append("其他 %.0f" % sum(v for _, v in rest))
-            self.lbl_bd.setText(" · ".join(parts) + " W")
         except Exception:
             self.lbl_bd.setText("")
+        self._apply_size()
 
     # ---------------- 层级模式 ----------------
     @staticmethod
@@ -350,7 +369,7 @@ class MiniOverlay(QWidget):
         act_bot.setCheckable(True)
         act_bot.setChecked(not self._on_top)
         menu.addSeparator()
-        act_bd = menu.addAction("显示功耗构成")
+        act_bd = menu.addAction("显示功耗构成（全部项）")
         act_bd.setCheckable(True)
         act_bd.setChecked(self._show_bd)
         menu.addSeparator()
