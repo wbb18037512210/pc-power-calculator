@@ -490,6 +490,45 @@ with open(main.SESSION_FILE, encoding="utf-8") as f:
 assert "mini_visible" in _sd and "mini_pos" in _sd, list(_sd.keys())
 print("mini overlay OK | pos =", _sd["mini_pos"], "| visible =", _sd["mini_visible"])
 
+# ---- v18.13 悬浮窗：嵌入桌面 / 背景全透明 / 取消双击隐藏 ----
+from PySide6.QtWidgets import QWidget as _QW
+from PySide6.QtCore import Qt as _Qt, QPointF as _QF
+assert main.MiniOverlay.paintEvent is _QW.paintEvent, \
+    "背景要全透明，不应再重写 paintEvent 自绘圆角底板"
+assert main.MiniOverlay.mouseDoubleClickEvent is _QW.mouseDoubleClickEvent, \
+    "双击隐藏必须取消：拖动时误触会把窗口弄丢"
+for _n in ("lbl_w", "lbl_sub", "lbl_cost"):
+    _eff = getattr(w.mini, _n).graphicsEffect()
+    assert _eff is not None and _eff.blurRadius() >= 4 and _eff.offset() == _QF(0, 0), \
+        "%s 需要黑色描边，否则浅色壁纸上白字看不见" % _n
+# v18.15 层级：默认嵌入桌面（置底），切置顶后标志必须二选一、且始终保持可见
+assert w.mini.layer_on_top() is False, "默认应为嵌入桌面（不遮挡任何窗口）"
+_BOT = _Qt.WindowType.WindowStaysOnBottomHint
+_TOP = _Qt.WindowType.WindowStaysOnTopHint
+assert (w.mini.windowFlags() & _BOT), "嵌入桌面靠 WindowStaysOnBottomHint 实现"
+assert not (w.mini.windowFlags() & _TOP), "嵌入桌面时不能同时带置顶标志"
+w.mini.show()
+assert w.mini.isVisible(), "嵌入桌面模式下悬浮窗也必须可见"
+
+_got = []
+w.mini._layer_cb = lambda v: _got.append(v)
+w.mini.set_layer(True)
+assert w.mini.layer_on_top() is True, "切置顶后 layer_on_top 应为 True"
+assert (w.mini.windowFlags() & _TOP), "切置顶后应有置顶标志"
+assert not (w.mini.windowFlags() & _BOT), "置顶与置底不能同时存在"
+assert w.mini.isVisible(), "切层级后仍应保持可见（不能把窗口弄丢）"
+assert _got == [True], ("层级回调应被触发一次", _got)
+w.mini.set_layer(False)
+assert w.mini.layer_on_top() is False
+assert (w.mini.windowFlags() & _BOT) and not (w.mini.windowFlags() & _TOP)
+assert _got == [True, False], _got
+
+# SetParent 挂桌面已废弃：分层子窗口在 Windows 上不渲染，会让悬浮窗彻底隐身
+assert not hasattr(w.mini, "_dock_to_desktop"), "SetParent 挂桌面方案已废弃"
+w.mini._layer_cb = None
+w.mini.hide()
+print("mini overlay v18.15 OK | 无底板 无双击隐藏 | 层级可切(置底/置顶) 切换后仍可见")
+
 # v18.9 回归：每日日报（小时桶汇总 → HTML 落盘）+ 跨天自动触发
 w.price_mode = "单一"; w.rate = 0.56
 w.hourly["2026-09-02 08:00"] = [400.0 * 2, 2]   # 均 400W → 0.4 kWh
@@ -604,6 +643,33 @@ w._refresh_readout()
 assert "（动态）" not in w.wall_sub.text(), w.wall_sub.text()
 print("readout dynamic-eff badge OK\n  动态:", _txt_dyn, "\n  固定:", w.wall_sub.text())
 
+# v18.13 读数行标签：直流 / 损耗 / 插座 三个数必须自洽，且与 cur 一致
+# （旧文案把直流值标成「含电源损耗」，看起来像开关屏数值反了）
+w.psu_rating_w = 650.0; w.model.psu_rating_w = 650.0
+for _don in (True, False):
+    _e = main.PM.estimate(w.model, 45, 47.0, True, _don)
+    w.cur = {"cpu_load": 45.0, "gpu_power": 47.0, "gpu_valid": True,
+             "wall": _e["wall_watts"], "sys": _e["sys_watts"],
+             "breakdown": _e["breakdown"], "display_on": _don,
+             "psu_eff": _e["psu_eff"]}
+    w.display_on = _don
+    w._refresh_readout()
+    _t = w.wall_sub.text()
+    _dc = float(_t.split("直流 ")[1].split(" W")[0])
+    _ls = float(_t.split("电源损耗 ")[1].split(" W")[0])
+    _so = float(_t.split("插座 ")[1].split(" W")[0])
+    assert abs(_dc - w.cur["sys"]) < 0.05, (_t, w.cur["sys"])
+    assert abs(_so - w.cur["wall"]) < 0.05, (_t, w.cur["wall"])
+    assert abs((_dc + _ls) - _so) < 0.05, "直流 + 损耗 必须等于插座: " + _t
+    assert _ls > 0, "含电源损耗时损耗必须为正: " + _t
+    if _don:
+        assert "显示器开" in _t, "开屏应显式标注状态: " + _t
+    else:
+        assert "显示器已关" in _t, "关屏应显式标注状态: " + _t
+    print("  屏幕%s: %s" % ("开" if _don else "关", _t))
+w.display_on = True
+print("readout label OK (直流 + 损耗 = 插座，开关屏状态均标注)")
+
 # 电源建议应只按主机峰值（不含显示器），且用峰值点效率
 w.psu_rating_w = 650.0; w.model.psu_rating_w = 650.0
 w._refresh_readout()
@@ -647,7 +713,16 @@ try:
     w._disp_manual = False
     main.H.foreground_fullscreen = lambda: True
     assert w._display_on() is False, "用户手动标记息屏时应以手动为准"
-    print("fullscreen exemption OK (video -> screen on, idle -> off, manual wins)")
+    # v18.14 生效期内（刚设完）即使有键鼠操作也不被自动唤醒抵消
+    # —— 否则用户选「记为关闭」看不到数值下降，会以为开关屏逻辑反了
+    main.H.user_idle_sec = lambda: 0.5          # 刚点完菜单，空闲≈0
+    w._disp_manual_ts = time.time()             # 刚设
+    assert w._display_on() is False, "生效期内有操作也必须保持「关闭」"
+    w._disp_manual_ts = time.time() - (main.DISP_MANUAL_GRACE_SEC + 60)
+    assert w._display_on() is True, "生效期过后有操作应自动恢复「开启」"
+    main.H.user_idle_sec = lambda: 600.0        # 还原为久空闲
+    assert w._display_on() is False, "生效期过后仍久空闲 → 维持关闭"
+    print("fullscreen exemption OK (video -> screen on, idle -> off, manual wins + grace)")
 finally:
     main.H.foreground_fullscreen, main.H.user_idle_sec = _f_orig
     w._disp_manual = None
@@ -690,6 +765,40 @@ finally:
     QMessageBox.information = _orig_info
     w.model.calib_idle = 0.0; w.model.calib_peak = 0.0
     w.psu_rating_w = 0.0; w.model.psu_rating_w = 0.0
+
+# ---- v18.16 设置抽屉不得横向裁切：内容最小宽度必须装得进可视区 ----
+# 之前的坑：长标签把 QFormLayout 的标签列撑到 228px，加上字段列共 525px，
+# 而抽屉可视区只有 470px —— 右侧内容直接被裁掉，表现为「设置显示不全」。
+w.resize(1080, 760)
+w._reposition_settings_dock()
+w._settings_dock.show()
+app.processEvents()
+_avail = w._settings_dock.viewport().width()
+_minw = w._settings_dock.widget().minimumSizeHint().width()
+assert _minw <= _avail, (
+    "设置内容最小宽度 %d px > 可视区 %d px，右侧会被裁掉" % (_minw, _avail))
+w._settings_dock.hide()
+print("settings dock no-clip OK | 内容最小 %d px <= 可视区 %d px" % (_minw, _avail))
+
+# ---- v18.15 报告直接导出 PDF + 迷你悬浮窗快照 ----
+_html = w._build_report_html()
+assert "迷你悬浮窗" in _html, "报告里应包含迷你悬浮窗快照"
+assert "瞬时插座功耗" in _html, "快照应含瞬时功耗行"
+assert "本轮累计" in _html, "快照应含本轮累计行"
+_pdf = os.path.join(_TMPDIR, "report_test.pdf")
+if os.path.exists(_pdf):
+    os.remove(_pdf)
+assert w._render_pdf(_html, _pdf) is True, "PDF 渲染应返回 True"
+assert os.path.exists(_pdf), "PDF 文件应生成"
+_size = os.path.getsize(_pdf)
+assert _size > 1024, "PDF 不应只有 %d 字节" % _size
+with open(_pdf, "rb") as _f:
+    assert _f.read(5) == b"%PDF-", "文件头应是 %PDF-"
+print("report PDF OK | %d bytes, 含迷你悬浮窗快照" % _size)
+# 导出入口应指向 PDF
+assert callable(w.export_report) and callable(w._save_pdf)
+assert hasattr(w, "_render_pdf")
+print("export_report -> PDF OK")
 
 w.close()
 print("HEADLESS_OK")

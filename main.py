@@ -20,23 +20,29 @@ import threading
 from datetime import datetime, timedelta
 from collections import deque
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal, QElapsedTimer, QDateTime, QEvent
+from PySide6.QtCore import (Qt, QThread, QTimer, Signal, QElapsedTimer, QDateTime,
+                            QEvent, QMarginsF, QSizeF)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QFrame, QLineEdit, QDoubleSpinBox, QSpinBox,
     QDialog, QFormLayout, QMessageBox, QFileDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QSizePolicy, QSpacerItem, QCheckBox, QSystemTrayIcon, QMenu,
     QProgressBar, QInputDialog, QTextBrowser, QComboBox, QScrollArea,
+    QGraphicsDropShadowEffect,
 )
 from PySide6.QtCharts import (QChart, QChartView, QLineSeries, QValueAxis,
                               QBarSeries, QBarSet, QBarCategoryAxis, QDateTimeAxis)
-from PySide6.QtGui import QPainter, QFont, QColor, QAction, QPixmap, QIcon
+from PySide6.QtGui import (QPainter, QFont, QColor, QAction, QPixmap, QIcon,
+                           QTextDocument, QPageLayout, QPageSize)
+# v18.15 报告导出 PDF：QtPrintSupport 本就在 PyInstaller 默认依赖里，
+# 相比 QWebEngine（+100MB）或 reportlab（第三方）成本最低。
+from PySide6.QtPrintSupport import QPrinter
 
 import hardware as H
 import power_model as PM
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.13"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.16"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 2000
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -44,6 +50,9 @@ PSU_COMMON = (300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 1000)
 # v18.11 手动标记「显示器已关」后，若检测到键鼠空闲短于该值，
 # 说明人已回来，自动恢复按开屏计费，避免忘记切回导致长期低估
 DISP_WAKE_IDLE_SEC = 20.0
+# v18.14 手动「记为关闭」的最短生效期（秒）。在此之前即使有键鼠操作也不自动唤醒，
+# 否则刚设完就被覆盖，用户根本看不到关屏后的功率下降。
+DISP_MANUAL_GRACE_SEC = 300.0
 # 会话文件位置：打包成 exe 后用可执行文件所在目录（__file__ 会指向临时解压目录）
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
@@ -209,30 +218,108 @@ class SampleWorker(QThread):
 
 
 class MiniOverlay(QWidget):
-    """v18.8 桌面迷你悬浮窗：置顶、无边框半透明、可拖动；双击隐藏。
-    独立顶层窗口（不挂父级），主窗口隐藏入托盘时不受影响。"""
-    def __init__(self):
+    """v18.15 桌面迷你悬浮窗：贴着桌面显示、背景全透明、可拖动、右键切层级。
+
+    两种层级（右键悬浮窗切换，选择会记进会话）：
+      · 嵌入桌面（默认）：WindowStaysOnBottomHint —— 在壁纸之上、所有普通窗口
+        之下，视觉上就是「长在桌面上」，不遮挡任何程序，Win+D 也能看到。
+        代价：任何最大化窗口都会盖住它，这是桌面层的固有行为。
+      · 始终置顶：WindowStaysOnTopHint —— 任何窗口之上都可见。
+
+    v18.15 关键修正：不再用 SetParent 把窗口挂进桌面。
+      v18.13 把窗口 SetParent 到 Progman / SHELLDLL_DefView，窗口身份就从
+      「顶层窗口」变成了「子窗口」；而背景透明依赖 WS_EX_LAYERED，
+      分层子窗口在 Windows 上不渲染 —— 结果就是悬浮窗彻底隐身（用户反馈
+      「桌面上不显示」）。改为保持顶层窗口 + 置底标志，观感一致但不碰层级。
+
+    背景全透明：不画底板只显示文字，靠黑色描边保证深浅壁纸上都看得清。
+    v18.13 起取消双击隐藏（v18.8 行为），避免拖动时误触把窗口弄丢。
+    """
+    def __init__(self, on_top: bool = False):
         super().__init__(None)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
-                            Qt.WindowType.WindowStaysOnTopHint |
-                            Qt.WindowType.Tool)
+        self._on_top = bool(on_top)
+        self.setWindowFlags(self._flags_for(self._on_top))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(196, 104)
-        root = QVBoxLayout(self); root.setContentsMargins(14, 10, 14, 10); root.setSpacing(1)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 10, 14, 10)
+        root.setSpacing(1)
         self.lbl_w = QLabel("— W")
         self.lbl_w.setStyleSheet("color:#eef3ff; font-size:26px; font-weight:800;")
         self.lbl_sub = QLabel("监测中")
         self.lbl_sub.setStyleSheet("color:#9fb4d8; font-size:11px;")
         self.lbl_cost = QLabel("")
         self.lbl_cost.setStyleSheet("color:#ffd28a; font-size:12px; font-weight:600;")
-        root.addWidget(self.lbl_w); root.addWidget(self.lbl_sub); root.addWidget(self.lbl_cost)
+        root.addWidget(self.lbl_w)
+        root.addWidget(self.lbl_sub)
+        root.addWidget(self.lbl_cost)
+        # 没有底板，给文字加黑色描边（offset=0 的阴影即形成轮廓），
+        # 否则浅色壁纸上白色文字会完全看不见。
+        for _l in (self.lbl_w, self.lbl_sub, self.lbl_cost):
+            _sh = QGraphicsDropShadowEffect(_l)
+            _sh.setBlurRadius(8)
+            _sh.setOffset(0, 0)
+            _sh.setColor(QColor(0, 0, 0, 235))
+            _l.setGraphicsEffect(_sh)
+        self.setToolTip("左键拖动可移动\n右键：切换「嵌入桌面 / 始终置顶」或隐藏")
         self._drag = None
+        self._layer_cb = None      # 层级切换回调（主窗口用来写会话）
+        self._hide_cb = None       # 右键「隐藏」回调
 
-    def paintEvent(self, ev):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.NoPen); p.setBrush(QColor(18, 26, 44, 196))
-        p.drawRoundedRect(self.rect(), 12, 12)
+    # ---------------- 层级模式 ----------------
+    @staticmethod
+    def _flags_for(on_top: bool):
+        f = (Qt.WindowType.FramelessWindowHint |
+             Qt.WindowType.Tool |
+             Qt.WindowType.WindowDoesNotAcceptFocus)
+        # 置底 / 置顶二选一：置底 = 贴在桌面上且不遮挡任何窗口
+        f |= (Qt.WindowType.WindowStaysOnTopHint if on_top
+              else Qt.WindowType.WindowStaysOnBottomHint)
+        return f
+
+    def layer_on_top(self) -> bool:
+        """True=始终置顶，False=嵌入桌面（置底）。"""
+        return bool(self._on_top)
+
+    def set_layer(self, on_top: bool, notify: bool = True):
+        """切换「嵌入桌面 / 始终置顶」。改窗口标志后必须 hide+show 才生效。"""
+        on_top = bool(on_top)
+        self._on_top = on_top
+        was = self.isVisible()
+        self.hide()
+        self.setWindowFlags(self._flags_for(on_top))
+        if was:
+            self.show()
+        if notify and callable(self._layer_cb):
+            try:
+                self._layer_cb(self._on_top)
+            except Exception:
+                pass
+
+    # ---------------- 交互 ----------------
+    def contextMenuEvent(self, ev):
+        menu = QMenu(self)
+        act_top = menu.addAction("始终置顶（盖在所有窗口之上）")
+        act_top.setCheckable(True)
+        act_top.setChecked(self._on_top)
+        act_bot = menu.addAction("嵌入桌面（不遮挡任何窗口）")
+        act_bot.setCheckable(True)
+        act_bot.setChecked(not self._on_top)
+        menu.addSeparator()
+        act_hide = menu.addAction("隐藏悬浮窗")
+        chosen = menu.exec(ev.globalPos())
+        if chosen == act_top:
+            self.set_layer(True)
+        elif chosen == act_bot:
+            self.set_layer(False)
+        elif chosen == act_hide:
+            if callable(self._hide_cb):
+                try:
+                    self._hide_cb()
+                    return
+                except Exception:
+                    pass
+            self.hide()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -244,9 +331,6 @@ class MiniOverlay(QWidget):
 
     def mouseReleaseEvent(self, e):
         self._drag = None
-
-    def mouseDoubleClickEvent(self, e):
-        self.hide()   # 双击隐藏（托盘菜单可再开）
 
 
 class MainWindow(QMainWindow):
@@ -275,6 +359,8 @@ class MainWindow(QMainWindow):
         # v18.8 迷你悬浮窗状态
         self._mini_visible = False
         self._mini_pos = None
+        # v18.15 悬浮窗层级：True=始终置顶，False=嵌入桌面（置底）
+        self._mini_on_top = False
         # v18.9 每日日报：跨天检测锚点（首拍落今日，跨零点自动出前一日日报）
         self._last_date = None
         # 计费方式：单一 / 峰谷 / 阶梯
@@ -368,7 +454,7 @@ class MainWindow(QMainWindow):
             pass
         self._setup_tray()
         # v18.8 迷你悬浮窗：按会话恢复显示与位置
-        self.mini = MiniOverlay()
+        self.mini = MiniOverlay(on_top=getattr(self, '_mini_on_top', False))
         self.mini.hide()
         if self._mini_visible:
             if self._mini_pos:
@@ -400,8 +486,10 @@ class MainWindow(QMainWindow):
         self._settings_dock = QScrollArea(root)
         self._settings_dock.setWidgetResizable(True)
         self._settings_dock.setFrameShape(QFrame.Shape.NoFrame)
-        self._settings_dock.setFixedWidth(400)
-        self._settings_dock.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._settings_dock.setFixedWidth(520)
+        # v18.13 横向滚动条不能关：45 行表单的最小宽度会超过抽屉宽，
+        # 关掉之后超出的部分直接被裁掉（实测「设置显示不全」就是这个原因）
+        self._settings_dock.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         # v18.11 半透明抽屉：背景 92% 白 + viewport 同步透明，否则子控件会盖成实心
         self._settings_dock.setStyleSheet(
             "QScrollArea { background: rgba(255,255,255,216); border: none; "
@@ -480,7 +568,7 @@ class MainWindow(QMainWindow):
         col1.addWidget(self._lbl("插座实时功耗", "title"))
         self.wall_big = self._lbl("0.0 W", "big")
         col1.addWidget(self.wall_big)
-        self.wall_sub = self._lbl("系统功耗 0.0 W（含电源损耗）", "sub")
+        self.wall_sub = self._lbl("直流 0.0 W + 电源损耗 0.0 W = 插座 0.0 W（效率 0.85）", "sub")
         col1.addWidget(self.wall_sub)
         lay.addLayout(col1, 2)
 
@@ -860,7 +948,7 @@ class MainWindow(QMainWindow):
         # v18：始终监测，移除「开始监测」按钮
         self.btn_reset = QPushButton("重置"); self.btn_reset.setObjectName("ghost")
         self.btn_reset.clicked.connect(self.reset_session)
-        self.btn_export = QPushButton("导出报告"); self.btn_export.setObjectName("ghost")
+        self.btn_export = QPushButton("导出报告(PDF)"); self.btn_export.setObjectName("ghost")
         self.btn_export.clicked.connect(self.export_report)
         self.btn_csv = QPushButton("导出CSV"); self.btn_csv.setObjectName("ghost")
         self.btn_csv.clicked.connect(self.export_csv)
@@ -907,11 +995,31 @@ class MainWindow(QMainWindow):
         if manual is False:
             # 手动标记熄屏：人回来动键鼠后自动恢复按开屏计，
             # 无需手动切回（避免忘记切回造成长期低估）
+            # v18.14 关键修复：自动唤醒必须等「生效期」过了才允许发生。
+            # 之前刚点完菜单（空闲≈0s）就立刻被唤醒覆盖，用户选了「记为关闭」
+            # 却看不到数值下降，随后自己操作电脑负载上升 —— 看起来就是
+            # 「关屏后功率反而变高」。生效期内即使有操作也保持关闭。
             try:
-                if H.user_idle_sec() < DISP_WAKE_IDLE_SEC:
-                    return True
+                _idle = H.user_idle_sec()
             except Exception:
-                pass
+                _idle = 1e9
+            _held = time.time() - float(getattr(self, "_disp_manual_ts", 0.0) or 0.0)
+            if _idle < DISP_WAKE_IDLE_SEC:
+                if _held < DISP_MANUAL_GRACE_SEC:
+                    return False          # 生效期内：有操作也保持「关闭」
+                if not getattr(self, "_disp_wake_notified", False):
+                    self._disp_wake_notified = True
+                    try:
+                        self._notify(
+                            "已自动恢复按「显示器开启」计算",
+                            f"「记为关闭」已生效 {DISP_MANUAL_GRACE_SEC/60:.0f} 分钟，"
+                            f"且检测到键鼠操作（空闲 {_idle:.0f} 秒），"
+                            f"为避免长期低估已自动恢复。\n\n"
+                            f"需要再按关闭计，请在托盘菜单重新选择。")
+                    except Exception:
+                        pass
+                return True
+            self._disp_wake_notified = False
             return False
         try:
             return not H.display_auto_off()
@@ -921,6 +1029,8 @@ class MainWindow(QMainWindow):
     def _set_display_manual(self, state):
         """state: None=自动检测 / True=强制记为开 / False=强制记为关（熄屏省电）"""
         self._disp_manual = state
+        self._disp_manual_ts = time.time()     # v18.14 记下手动标记时间，用于生效期判定
+        self._disp_wake_notified = False       # 换档后重新允许提示一次
         self.display_on = self._display_on()
         mon_w = float(getattr(self.model, "components", {}).get("显示器", 0.0) or 0.0)
         if state is False:
@@ -1087,19 +1197,28 @@ class MainWindow(QMainWindow):
             calib_note = f" · 已用实测待机{self.calib_idle:.0f}/满载{self.calib_peak:.0f}W校准"
         elif self.calib_k != 1.0:
             calib_note = f" · 已用系数×{self.calib_k:.2f}校准"
-        disp_note = ""
-        if not getattr(self, "display_on", True):
-            _mon = float(getattr(self.model, "components", {}).get("显示器", 0.0) or 0.0)
+        disp_on = bool(getattr(self, "display_on", True))
+        _mon = float(getattr(self.model, "components", {}).get("显示器", 0.0) or 0.0)
+        if not disp_on:
             disp_note = (f" · 显示器已关（省 {_mon:.0f}W，"
                          f"累计省 {self._disp_saved_wh/1000.0:.3f} 度）")
+        elif _mon > 0:
+            # v18.13 开屏也把状态写明：用户分不清「读到的数是开屏还是关屏」，
+            # 只标注关屏的话，开屏时那行看不出显示器到底计没计进去。
+            disp_note = f" · 显示器开（计 {_mon:.0f}W）"
         # v18.11：填了额定功率就用 80 PLUS 曲线算出的实时效率，否则用固定效率
         _eff_live = self.cur.get("psu_eff")
         if not _eff_live:
             _eff_live = self.model.psu_efficiency
         _eff_note = "（动态）" if float(getattr(self, "psu_rating_w", 0.0) or 0.0) > 0 else ""
+        # v18.13 修正标签：self.cur['sys'] 是直流功耗（不含电源损耗），
+        # 含损耗的是上面的大数字 wall。旧文案把这行标成「含电源损耗」，
+        # 于是「大数字 220W / 这行 190W」看起来像是开关屏数值反了。
+        _loss = max(0.0, float(self.cur["wall"]) - float(self.cur["sys"]))
         self.wall_sub.setText(
-            f"系统功耗 {self.cur['sys']:.1f} W（含电源损耗 / 效率 "
-            f"{_eff_live:.2f}{_eff_note}{calib_note}）{disp_note}")
+            f"直流 {self.cur['sys']:.1f} W + 电源损耗 {_loss:.1f} W "
+            f"= 插座 {self.cur['wall']:.1f} W"
+            f"（效率 {_eff_live:.2f}{_eff_note}{calib_note}）{disp_note}")
         kwh = self.energy_wh / 1000.0
         self.energy_big.setText(f"{kwh:.3f} kWh")
         self.cost_sub.setText(f"电费 ¥{self._current_cost():.2f}"
@@ -1452,7 +1571,7 @@ class MainWindow(QMainWindow):
     def _build_settings_panel(self):
         panel = QWidget(); panel.setObjectName("settingsPanel")
         panel.setStyleSheet("QWidget#settingsPanel { background: transparent; } " + CSS)
-        vl = QVBoxLayout(panel); vl.setContentsMargins(16, 14, 16, 14); vl.setSpacing(10)
+        vl = QVBoxLayout(panel); vl.setContentsMargins(12, 12, 12, 12); vl.setSpacing(10)
         # v18.10 标题栏：标题 + ✕ 收起按钮
         head = QHBoxLayout()
         cap = QLabel(f"<b>设置</b> · {APP_VERSION}")
@@ -1465,6 +1584,8 @@ class MainWindow(QMainWindow):
         head.addWidget(btn_x)
         vl.addLayout(head)
         form_w = QWidget(); fl = QFormLayout(form_w); fl.setSpacing(9)
+        # v18.13 让输入框跟随可用宽度伸展，而不是把整行撑到超过抽屉宽度
+        fl.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         rate = QDoubleSpinBox(); rate.setRange(0.1, 5.0); rate.setDecimals(2)
         rate.setValue(self.rate); rate.setSuffix(" 元/度")
         win = QDoubleSpinBox(); win.setRange(0.1, 720); win.setDecimals(1)
@@ -1523,19 +1644,19 @@ class MainWindow(QMainWindow):
         fl.addRow("电价", rate); fl.addRow("监测时长", win)
         fl.addRow("电源效率", eff); fl.addRow("电源额定功率", pr_w)
         fl.addRow("采样间隔", samp)
-        fl.addRow(QLabel("<b>计费方式</b>"), QLabel(""))
+        fl.addRow(QLabel("<b>计费方式</b>"))
         fl.addRow("  方式", mode)
-        fl.addRow(QLabel("<b>阶梯电价（居民月用量分档）</b>"), QLabel(""))
+        fl.addRow(QLabel("<b>阶梯电价（居民月用量分档）</b>"))
         fl.addRow("  本月已用基数", tbase)
-        fl.addRow("  档1 上限 / 电价", tl1)
+        fl.addRow("  档1 上限", tl1)
         fl.addRow("  档1 电价", tr1)
-        fl.addRow("  档2 上限 / 电价", tl2)
+        fl.addRow("  档2 上限", tl2)
         fl.addRow("  档2 电价", tr2)
         fl.addRow("  档3 电价", tr3)
-        fl.addRow(QLabel("<b>峰谷分时</b>"), QLabel(""))
-        fl.addRow("  谷价 (23-7点)", rv)
-        fl.addRow("  平价 (其余时段)", rf)
-        fl.addRow("  峰价 (8-11/18-21)", rp)
+        fl.addRow(QLabel("<b>峰谷分时</b>"))
+        fl.addRow("  谷价", rv)
+        fl.addRow("  平价", rf)
+        fl.addRow("  峰价", rp)
         # 峰谷时段边界（可自定义）
         vsb = QSpinBox(); vsb.setRange(0, 23); vsb.setValue(self.tou_valley[0])
         veb = QSpinBox(); veb.setRange(0, 23); veb.setValue(self.tou_valley[1])
@@ -1543,19 +1664,19 @@ class MainWindow(QMainWindow):
         p1e = QSpinBox(); p1e.setRange(0, 23); p1e.setValue(self.tou_peak[0][1] if len(self.tou_peak) > 0 else 0)
         p2s = QSpinBox(); p2s.setRange(0, 23); p2s.setValue(self.tou_peak[1][0] if len(self.tou_peak) > 1 else 0)
         p2e = QSpinBox(); p2e.setRange(0, 23); p2e.setValue(self.tou_peak[1][1] if len(self.tou_peak) > 1 else 0)
-        fl.addRow(QLabel("<b>峰谷时段（小时，可改）</b>"), QLabel(""))
+        fl.addRow(QLabel("<b>峰谷时段（小时，可改）</b>"))
         fl.addRow("  谷 起", vsb); fl.addRow("  谷 止", veb)
         fl.addRow("  峰1 起", p1s); fl.addRow("  峰1 止", p1e)
         fl.addRow("  峰2 起", p2s); fl.addRow("  峰2 止", p2e)
-        fl.addRow(QLabel("  （平价=其余时段；起=止表示禁用该段）"), QLabel(""))
+        fl.addRow(QLabel("  （平价=其余时段；起=止表示禁用该段）"))
         # 功耗告警
         al = QCheckBox("功耗超阈值告警（弹系统通知）")
         al.setChecked(self.alert_enabled)
         alth = QDoubleSpinBox(); alth.setRange(50, 2000); alth.setDecimals(0)
         alth.setValue(self.alert_threshold); alth.setSuffix(" W")
-        fl.addRow(QLabel("<b>功耗告警</b>"), QLabel(""))
+        fl.addRow(QLabel("<b>功耗告警</b>"))
         fl.addRow("  启用", al)
-        fl.addRow("  阈值(插座W)", alth)
+        fl.addRow("  告警阈值", alth)
         # 月度用电预算
         bk = QDoubleSpinBox(); bk.setRange(0, 100000); bk.setDecimals(0)
         bk.setValue(self.budget_kwh); bk.setSuffix(" kWh")
@@ -1565,33 +1686,33 @@ class MainWindow(QMainWindow):
         bap.setValue(self.budget_alert_pct); bap.setSuffix(" %")
         bal = QCheckBox("预算达到阈值时弹系统通知")
         bal.setChecked(self.budget_alert_enabled)
-        fl.addRow(QLabel("<b>月度用电预算</b>"), QLabel(""))
-        fl.addRow("  月度电量预算(kWh, 0=不设)", bk)
-        fl.addRow("  月度电费预算(¥, 0=不设)", bc)
-        fl.addRow("  预警阈值比例", bap)
+        fl.addRow(QLabel("<b>月度用电预算</b>"))
+        fl.addRow("  电量预算 kWh", bk)
+        fl.addRow("  电费预算 ¥", bc)
+        fl.addRow("  预警比例", bap)
         fl.addRow("  启用预算预警", bal)
         # 待机识别
         ict = QDoubleSpinBox(); ict.setRange(0, 50); ict.setDecimals(0)
         ict.setValue(self.idle_cpu_thresh); ict.setSuffix(" %")
         igt = QDoubleSpinBox(); igt.setRange(0, 200); igt.setDecimals(0)
         igt.setValue(self.idle_gpu_thresh); igt.setSuffix(" W")
-        fl.addRow(QLabel("<b>待机识别</b>"), QLabel(""))
-        fl.addRow("  CPU 负载≤(视为空闲)", ict)
-        fl.addRow("  GPU 功耗≤(视为空闲)", igt)
+        fl.addRow(QLabel("<b>待机识别</b>"))
+        fl.addRow("  CPU 负载≤", ict)
+        fl.addRow("  GPU 功耗≤", igt)
         # 待机自动提醒
         inud = QCheckBox("长时间空闲自动提醒（建议睡眠/关机）")
         inud.setChecked(self.idle_nudge_enabled)
         inm = QDoubleSpinBox(); inm.setRange(1, 120); inm.setDecimals(0)
         inm.setValue(self.idle_nudge_min); inm.setSuffix(" 分钟")
-        fl.addRow(QLabel("<b>待机自动提醒</b>"), QLabel(""))
+        fl.addRow(QLabel("<b>待机自动提醒</b>"))
         fl.addRow("  启用提醒", inud)
-        fl.addRow("  连续空闲达(分钟)", inm)
+        fl.addRow("  连续空闲 ≥", inm)
         # 开机自启
         au = QCheckBox("开机自启（启动后最小化到托盘）")
         au.setChecked(self.autostart)
         aum = QCheckBox("开机自启后自动开始监测")
         aum.setChecked(self.autostart_monitor)
-        fl.addRow(QLabel("<b>开机自启</b>"), QLabel(""))
+        fl.addRow(QLabel("<b>开机自启</b>"))
         fl.addRow("  开机自启", au)
         fl.addRow("  自启即监测", aum)
         # v18.10 迷你悬浮窗开关（与托盘菜单同步）
@@ -1610,7 +1731,7 @@ class MainWindow(QMainWindow):
             "系统无法感知手动按显示器电源键关屏，需在此手动标记；\n"
             "标记为关闭后，一旦检测到键鼠操作会自动恢复按开启计。")
         fl.addRow("  显示器状态", disp_cb)
-        fl.addRow(QLabel("<b>精度校准</b>"), QLabel(""))
+        fl.addRow(QLabel("<b>精度校准</b>"))
         fl.addRow("单系数倍率", ck)
         fl.addRow("实测待机功耗", cidle)
         fl.addRow("实测满载功耗", cpeak)
@@ -1791,9 +1912,10 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
         if auto:
             # v18 后台常驻：到点自动归档、报告落盘、无缝开启新一轮（不弹窗打断）
             try:
-                out = os.path.join(BASE_DIR, f"用电报告_{datetime.now().strftime('%Y%m%d_%H%M')}.html")
-                with open(out, "w", encoding="utf-8") as f:
-                    f.write(html)
+                # v18.15 自动归档也直接落 PDF（此前是 HTML）
+                out = os.path.join(BASE_DIR, f"用电报告_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf")
+                if not self._render_pdf(html, out):
+                    out = ""
             except Exception:
                 out = ""
             self.reset_session()   # reset_session 内已置 running=True 并清空累计
@@ -1814,8 +1936,16 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
         # 是 exe 膨胀到 206MB 的绝对大头，已移除。
         view = QTextBrowser(); view.setHtml(html)
         vl.addWidget(view, 1)
-        bt = QPushButton("保存报告(HTML)"); bt.clicked.connect(lambda: self._save_html(html))
-        vl.addWidget(bt)
+        # v18.15 主按钮改为 PDF；HTML 保留作为备用（可二次排版/贴进文档）
+        row = QHBoxLayout()
+        bt = QPushButton("保存报告(PDF)"); bt.setObjectName("primary")
+        bt.clicked.connect(lambda: self._save_pdf(html))
+        bt2 = QPushButton("保存报告(HTML)"); bt2.setObjectName("ghost")
+        bt2.clicked.connect(lambda: self._save_html(html))
+        bt3 = QPushButton("关闭"); bt3.setObjectName("ghost")
+        bt3.clicked.connect(d.accept)
+        row.addWidget(bt); row.addWidget(bt2); row.addStretch(1); row.addWidget(bt3)
+        vl.addLayout(row)
         d.exec()
 
     def _build_report_html(self) -> str:
@@ -1893,6 +2023,42 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
                           f"<th align='right'>占比</th></tr>{rows}</table>"
                           f"<div style='font-size:11px;color:#8a93a6;margin-top:4px;'>"
                           f"估算方式：按各进程 CPU 占用时间占比分摊 CPU 估算功耗；GPU/磁盘/内存不做分摊。</div></div>")
+        # v18.15 迷你悬浮窗快照：把悬浮窗此刻显示的三行内容原样写进报告，
+        # 这样导出的 PDF 里也能看到「导出瞬间」的实时读数，而不只是汇总值。
+        mini_block = ""
+        try:
+            _m = getattr(self, "mini", None)
+            _wall = float(self.cur.get("wall", 0.0) or 0.0)
+            _sys = float(self.cur.get("sys", 0.0) or 0.0)
+            _eff = float(self.cur.get("psu_eff") or self.psu_eff or 0.0)
+            _eff_note = "（动态）" if float(getattr(self, "psu_rating_w", 0.0) or 0.0) > 0 else ""
+            _disp = "开" if self.cur.get("display_on", True) else "关"
+            _mon = float(getattr(self.model, "components", {}).get("显示器", 0.0) or 0.0)
+            _dyn = "动态" if _eff_note else "固定"
+            _mw = _m.lbl_w.text() if _m is not None else f"{_wall:.0f} W"
+            _ms = _m.lbl_sub.text() if _m is not None else ("监测中" if self.running else "已暂停")
+            _mc = _m.lbl_cost.text() if _m is not None else ""
+            if not _mc:
+                _mc = "本轮 %.3f kWh · ¥%.2f" % (self.energy_wh / 1000.0, self._current_cost())
+            _pos = f"（{_m.x()}, {_m.y()}）" if _m is not None else "—"
+            _vis = "显示中" if (_m is not None and _m.isVisible()) else "已隐藏"
+            _dock = ("始终置顶" if (_m is not None and _m.layer_on_top())
+                     else "嵌入桌面（置底）")
+            mini_block = (
+                f"<div class='card'><div class='k'>迷你悬浮窗（导出瞬间快照）</div>"
+                f"<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
+                f"<tr><td>第一行 · 瞬时插座功耗</td><td style='text-align:right'>{_mw}</td></tr>"
+                f"<tr><td>第二行 · 监测状态</td><td style='text-align:right'>{_ms} · 显示器{_disp}</td></tr>"
+                f"<tr><td>第三行 · 本轮累计</td><td style='text-align:right'>{_mc}</td></tr>"
+                f"<tr><td>插座 / 直流系统功耗</td><td style='text-align:right'>{_wall:.1f} W / {_sys:.1f} W</td></tr>"
+                f"<tr><td>电源效率</td><td style='text-align:right'>{_eff:.2f} {_dyn}</td></tr>"
+                f"<tr><td>显示器功耗 / 累计节省</td>"
+                f"<td style='text-align:right'>{_mon:.0f} W / {self._disp_saved_wh/1000.0:.3f} kWh</td></tr>"
+                f"<tr><td>窗口位置 / 显示方式</td>"
+                f"<td style='text-align:right'>{_pos} · {_dock} · {_vis}</td></tr>"
+                f"</table></div>")
+        except Exception:
+            mini_block = ""
         avg_w = (self.energy_wh / elapsed_h) if (elapsed_h > 0.001 and self.energy_wh > 0) else (self.cur["wall"] or 0.0)
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         if self.calib_idle > 0 and self.calib_peak > 0:
@@ -1942,6 +2108,7 @@ td{{padding:6px 4px;border-bottom:1px solid #eef1f7;}}
   </div></div>
 <div class="card"><div class="k">功耗构成（当前估算）</div>
   <table>{bd_rows}</table></div>
+{mini_block}
 <div class="card"><div class="k">逐小时平均功耗</div>{bars}</div>
 {pblock}
 {proj}
@@ -1951,6 +2118,40 @@ td{{padding:6px 4px;border-bottom:1px solid #eef1f7;}}
 CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_note}</div>
 </body></html>"""
 
+    def _render_pdf(self, html: str, path: str) -> bool:
+        """把报告 HTML 渲染成 PDF 文件；成功返回 True，不弹任何对话框。
+
+        用 QTextDocument + QPrinter(PdfFormat) 直接打印到 PDF：
+        · 纯 Qt，无需 reportlab / wkhtmltopdf 之类外部依赖，完全离线；
+        · 相比 QWebEngineView 不会让 exe 膨胀 100MB+；
+        · 指定 Microsoft YaHei，中文字形正常（宋体回退也能显示）。
+        """
+        try:
+            doc = QTextDocument()
+            doc.setDefaultFont(QFont("Microsoft YaHei", 10))
+            doc.setHtml(html)
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+            printer.setOutputFileName(path)
+            # Qt6 移除了 QPrinter.PageSize，页面尺寸统一走 QPageSize。
+            # 排版参数失败不该让整个导出挂掉，所以单独兜住。
+            try:
+                printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+                printer.setPageMargins(QMarginsF(14, 14, 14, 14),
+                                       QPageLayout.Unit.Millimeter)
+                # 让文档按打印机的可打印区域排版，分页才正确
+                doc.setPageSize(QSizeF(printer.pageRect(QPrinter.Unit.DevicePixel).size()))
+            except Exception:
+                pass
+            doc.print_(printer)
+            return os.path.exists(path) and os.path.getsize(path) > 0
+        except Exception as e:
+            try:
+                print("[pdf] 渲染失败: %r" % (e,))
+            except Exception:
+                pass
+            return False
+
     def _save_html(self, html: str):
         path, _ = QFileDialog.getSaveFileName(self, "保存报告", "PC用电汇总.html", "HTML (*.html)")
         if path:
@@ -1958,9 +2159,26 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 f.write(html)
             QMessageBox.information(self, "已保存", f"报告已保存到：\n{path}")
 
+    def _save_pdf(self, html: str) -> bool:
+        """弹出保存对话框，把当前报告导出为 PDF。"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存报告(PDF)", "PC用电汇总.pdf", "PDF 文档 (*.pdf)")
+        if not path:
+            return False
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        ok = self._render_pdf(html, path)
+        if ok:
+            QMessageBox.information(self, "已保存", f"PDF 报告已保存到：\n{path}")
+        else:
+            QMessageBox.warning(self, "导出失败",
+                                "PDF 未能生成，请确认路径可写后重试。")
+        return ok
+
     def export_report(self):
+        """v18.15 起「导出报告」直接输出 PDF（旧版是 HTML）。"""
         html = self._build_report_html()
-        self._save_html(html)
+        self._save_pdf(html)
 
     def open_compare(self):
         """同一份累计数据，对比「单一电价」与「峰谷电价」两种方案的电费差异。"""
@@ -2062,6 +2280,9 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 "mini_visible": self._mini_visible,
                 "mini_pos": ([self.mini.x(), self.mini.y()]
                              if getattr(self, "mini", None) is not None else self._mini_pos),
+                "mini_on_top": (self.mini.layer_on_top()
+                                if getattr(self, "mini", None) is not None
+                                else getattr(self, "_mini_on_top", False)),
                 # v18.11 显示器状态与熄屏省电累计
                 "disp_manual": self._disp_manual,
                 "disp_saved_wh": self._disp_saved_wh,
@@ -2143,6 +2364,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         dm = d.get("disp_manual", None)
         self._disp_manual = dm if isinstance(dm, bool) else None
         self._disp_saved_wh = float(d.get("disp_saved_wh", 0.0) or 0.0)
+        self._mini_on_top = bool(d.get("mini_on_top", False))
         mp = d.get("mini_pos")
         if isinstance(mp, (list, tuple)) and len(mp) == 2:
             try:
@@ -2552,11 +2774,22 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
             cost = 0.0
         m.lbl_cost.setText(f"本轮 {self.energy_wh/1000.0:.3f} kWh · ¥{cost:,.2f}")
 
+    def _on_mini_layer(self, on_top: bool):
+        """悬浮窗层级被右键切换：记录下来并立即落盘，下次启动保持。"""
+        self._mini_on_top = bool(on_top)
+        try:
+            self._save_session()
+        except Exception:
+            pass
+
     def _toggle_mini(self, on: bool):
         """v18.8 开关迷你悬浮窗（托盘菜单/设置面板/会话恢复共用）。"""
         self._mini_visible = bool(on)
         if self.mini is None:
-            self.mini = MiniOverlay()
+            self.mini = MiniOverlay(on_top=getattr(self, '_mini_on_top', False))
+            # 右键切层级 / 右键隐藏 都回落到主窗口，便于同步设置与落盘
+            self.mini._layer_cb = self._on_mini_layer
+            self.mini._hide_cb = lambda: self._toggle_mini(False)
         if on:
             if self._mini_pos:
                 self.mini.move(int(self._mini_pos[0]), int(self._mini_pos[1]))
@@ -2629,11 +2862,20 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         self.activateWindow()
 
     def _notify(self, title: str, body: str):
+        """v18.13 非阻塞通知。
+
+        绝不能退化成模态框：_display_on() 每次采样都会走到这里，
+        托盘不可用时弹 QMessageBox 会直接把整个监测冻住
+        （离屏回归就是这么挂了 6 分钟）。托盘不可用就只记日志。
+        """
         try:
             if self.tray is not None:
                 self.tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Warning, 4000)
-            else:
-                QMessageBox.warning(self, title, body)
+                return
+        except Exception:
+            pass
+        try:
+            print("[notify] %s | %s" % (title, str(body).replace("\n", " ")))
         except Exception:
             pass
 

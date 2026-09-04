@@ -23,3 +23,7 @@ app.lock
 用电日报_*.html
 用电报告_*.html
 PC用电汇总.html
+
+# 诊断脚本 / 数据备份
+_savedata/
+_probe_*.py
