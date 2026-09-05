@@ -98,6 +98,9 @@ class PowerModel:
     gpu_idle: float = 15.0
     gpu_max: float = 180.0
     gpu_is_nvidia: bool = False
+    # v18.29+ 识别置信度：high=表精确命中 / medium=后缀剥离命中 / low=走启发式（可能偏差大）
+    cpu_conf: str = "high"
+    gpu_conf: str = "high"
     static_idle: float = 0.0
     static_load_add: float = 0.0
     psu_efficiency: float = PSU_EFFICIENCY
@@ -171,35 +174,16 @@ def _find_key(name: str, table: dict) -> Optional[int]:
 def build_model(hw, psu_efficiency: float = PSU_EFFICIENCY) -> PowerModel:
     m = PowerModel(psu_efficiency=psu_efficiency, gpu_is_nvidia=hw.gpu_is_nvidia)
 
-    # CPU
-    tdp = _find_key(hw.cpu_name, CPU_TDP)
-    if tdp is None:
-        # 启发式：从型号数字推测（如 "Ryzen 7" → 65~105）
-        if re.search(r"Ryzen\s*[79]", hw.cpu_name, re.I) or re.search(r"i[79]-1[34]", hw.cpu_name):
-            tdp = 105
-        elif re.search(r"Ryzen\s*5", hw.cpu_name, re.I) or re.search(r"i[35]", hw.cpu_name):
-            tdp = 65
-        else:
-            tdp = 65
+    # CPU（v18.29+：改用 identify_cpu，带置信度；未识别时回落原启发式，语义不变）
+    tdp, cpu_conf, _m = identify_cpu(hw.cpu_name)
+    m.cpu_conf = cpu_conf
     m.cpu_tdp = float(tdp)
     m.cpu_idle = round(tdp * 0.30, 1)        # 空载约 30% TDP
     m.cpu_max = round(tdp * 1.40, 1)         # 满载含 boost 约 1.4x
 
-    # GPU
-    gtdp = _find_key(hw.gpu_name, GPU_TDP)
-    if gtdp is None:
-        # 依据显存粗估
-        vram_gb = hw.gpu_vram_bytes / 1e9
-        if vram_gb >= 20:
-            gtdp = 400
-        elif vram_gb >= 12:
-            gtdp = 300
-        elif vram_gb >= 8:
-            gtdp = 220
-        elif vram_gb >= 4:
-            gtdp = 150
-        else:
-            gtdp = 75
+    # GPU（v18.29+：改用 identify_gpu，带置信度；未识别时回落原显存启发式，语义不变）
+    gtdp, gpu_conf, _m2 = identify_gpu(hw.gpu_name, hw.gpu_vram_bytes / 1e9)
+    m.gpu_conf = gpu_conf
     m.gpu_tdp = float(gtdp)
     m.gpu_idle = round(max(8.0, gtdp * 0.08), 1)
     m.gpu_max = float(gtdp)
@@ -278,6 +262,24 @@ def estimate(model: PowerModel, cpu_load: float, gpu_power: Optional[float],
         "psu_eff": round(_eff, 4),        # 实际采用的转换效率（供 UI 展示）
         "breakdown": breakdown,
     }
+
+
+# --------------------------------------------------------------------------- #
+# v18.29+ 型号识别增强（审查报告 §5.1）：补表 + 后缀剥离 + 预编译索引 + 置信度
+# 放在文件末尾：此时本模块已完整定义，可安全 import hardware_id_v2（其模块级
+# 会读取 PM.GPU_TDP）。整段包在 try 里：v2 模块缺失时退回原 _find_key 实现，
+# 行为不退化。
+# --------------------------------------------------------------------------- #
+try:
+    from hardware_id_v2 import (
+        GPU_TDP_EXTRA, CPU_TDP_EXTRA, find_key_v2,
+        identify_gpu, identify_cpu, needs_calibration_hint,
+    )
+    GPU_TDP.update(GPU_TDP_EXTRA)                 # 增量补表（+27 GPU / +31 CPU 型号）
+    CPU_TDP.update(CPU_TDP_EXTRA)
+    _find_key = lambda n, t: find_key_v2(n, t, allow_suffix_strip=True)  # 原地替换，签名一致
+except Exception:  # pragma: no cover - v2 缺失属异常环境，退回原实现
+    pass
 
 
 if __name__ == "__main__":

@@ -53,6 +53,10 @@ class PowerEngine:
     period_energy_wh: dict = field(default_factory=lambda: {"谷": 0.0, "平": 0.0, "峰": 0.0})
     idle_energy_wh: float = 0.0
     active_energy_wh: float = 0.0
+    # v18.29+ 对齐 MainWindow 的运行时状态（消除双实现漂移，见审查报告 §5.2 D3）
+    idle_streak_ms: float = 0.0
+    disp_saved_wh: float = 0.0
+    hourly: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
     def tick(self, cpu_load: float, gpu_power: Optional[float], gpu_valid: bool,
@@ -110,21 +114,28 @@ class PowerEngine:
             c += (kwh - self.tier_l2) * self.tier_r3
         return c
 
-    def simulate(self, hours_off: float, target_eff: float) -> dict:
-        """节能情景模拟（原 MainWindow._simulate 的纯逻辑版）。"""
+    def simulate(self, hours_off: float, target_eff: float,
+                 cur_psu_eff: float = None, cur_wall: float = 0.0) -> dict:
+        """节能情景模拟：与 MainWindow._simulate 逐项对齐（消除双实现漂移，§5.2 D1/D2/D3）。
+
+        cur_psu_eff: 当前实时电源效率（来自 est['psu_eff']）；None 表示未启用动态曲线，
+                     退回 model.psu_efficiency —— 与 MainWindow 的 `or` 语义一致。
+        cur_wall   : 当前插座功率，用于冷启动（energy_wh==0）时的 avg_w 兜底。
+        """
         elapsed_h = max(self.running_elapsed_ms / 3_600_000.0, 1e-9)
-        avg_w = (self.energy_wh / elapsed_h) if self.energy_wh > 0 else 0.0
+        avg_w = (self.energy_wh / elapsed_h) if (self.energy_wh > 0 and elapsed_h > 1e-6) \
+            else (cur_wall or 0.0)                                   # D2
         kwh_total = self.energy_wh / 1000.0
         blended = (self.current_cost() / kwh_total) if kwh_total > 0 else self.rate
-        eff_old = getattr(self.model, "psu_efficiency", 0.85)
+        eff_old = cur_psu_eff or self.model.psu_efficiency           # D1
         sa_kwh = avg_w * hours_off / 1000.0 * 30.0
         sa = sa_kwh * blended
-        wall_month = avg_w * 720.0 / 1000.0
+        wall_month = avg_w * 720.0 / 1000.0                          # D3
         sys_month = wall_month * eff_old
         sb_kwh = sys_month * (1.0 / eff_old - 1.0 / target_eff) if target_eff > 0 else 0.0
         sb = sb_kwh * blended
-        return {"avg_w": avg_w, "blended": blended, "sa": sa, "sb": sb,
-                "sa_kwh": sa_kwh, "sb_kwh": sb_kwh}
+        return {"avg_w": avg_w, "blended": blended, "wall_month": wall_month,
+                "sa_kwh": sa_kwh, "sa": sa, "sb_kwh": sb_kwh, "sb": sb}
 
     # ------------------------------------------------------------------ #
     # 设置字典 <-> 引擎（对接 MainWindow 的 40 字段设置，解决 W4 单点维护）

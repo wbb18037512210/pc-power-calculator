@@ -5,6 +5,49 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.29 — 代码审查报告 §1.2 主要不足(W) 全部修复
+
+> 用户要求：依据 `代码审查评估报告_v18.29.md` 的「1.2 主要不足(W)」，**全部解决** 7 项弱点。
+> 版本号仍为 v18.29（本轮为代码质量修复，未改功能版本）。
+
+### W1 · 孤儿引擎模块 `PowerEngine` 漂移
+- `power_core.PowerEngine` 此前被 `MainWindow` 零引用，且三处已与 `MainWindow` 漂移：
+  - D1 基准效率 `0.89` vs `0.85` → 统一为「实时效率优先，缺省 0.85」；
+  - D2 冷启动 `avg_w` `239.4` vs `0.0` → 冷启动（累计电量为 0）回退到插座功率兜底；
+  - D3 缺 `wall_month` / `idle_streak_ms` / `disp_saved_wh` / `hourly` 状态 → 补齐字段并随 simulate 返回 `wall_month`。
+- `MainWindow._simulate` 改为**委托** `PowerEngine.simulate`（单一真相源），删除本地重复实现。
+- 新增 `tests/test_parity.py`：把旧 `_simulate` 复刻与引擎对照（热态 + 冷启动），任一方改坏口径立即报错。
+
+### W2 · 硬件识别静默大误差（RTX3050 +69% / Arc A770 +33% / Ultra9 −48%）
+- 新增 `hardware_id_v2.py`：`GPU_TDP_EXTRA`（+27 型号）、`CPU_TDP_EXTRA`（+31 型号）增量表、`find_key_v2`（预编译索引 + 后缀剥离）、`identify_gpu/identify_cpu` 返回 `(watts, confidence, method)`，`confidence ∈ {high, medium, low}`。
+- `power_model.build_model` 改为**置信度感知**：低置信度不再静默翻车，模型带 `cpu_conf`/`gpu_conf` 标记。
+- 验证：RTX 3050→130W、Arc A770→225W、Core Ultra 9 285K→125W、i9-14900KF→125W 均命中；GPU_TDP 增至 75 项、CPU_TDP 增至 70 项。
+
+### W3 · 105 个 `except Exception`（53 个完全静默）
+- 引入 `self._degraded` 降级账本 + `_mark_degraded/_clear_degraded/_degraded_summary/_refresh_degraded_status`，状态栏标签与报告内均展示降级项。
+- 三段式约定（写入模块注释）：① 硬件探测类——记日志 + 状态栏标注「部分功能降级」；② UI 刷新类——保留静默但加「已知：UI 刷新失败可忽略」注释；③ 落盘类——必须留痕并给用户可见信号。
+- 崩溃防护：`__init__` 硬件检测失败不再拖垮整个程序，降级到空模板并登记账本；`_load_session_maybe` / `_save_session` / `collect_system_info` 失败均可见。
+- 新增 `tests/test_degraded.py` 守护账本行为。
+
+### W4 · `MainWindow` 膨胀（3478 行 / 81 方法）
+- 抽出 `_init_defaults()`（~80 行属性默认值），`__init__` 由 ~155 行降至 ~75 行；
+- 抽出 `_build_advanced_settings_rows(fl)`（告警/预算/待机/自启/显示器分组），`_build_settings_panel` 拆分；
+- 抽出 `_report_hourly_bars()`，`_build_report_html` 拆分。行为逐字节等价，headless 全量冒烟通过。
+
+### W5 · 43 个设置字段双份维护
+- 新增模块级 `_SETTINGS_SPEC` 单一真源（29 个配置字段 + 默认值）；
+- `_save_session` / `_load_session_maybe` 改为经 spec 循环读写，新增设置只改 spec 一处；`_sync_settings_to_model` 统一把配置同步进功耗模型。
+
+### W6 · 识别结果无「未识别」信号
+- 系统信息面板 CPU/GPU 行在低置信度时显示琥珀色「⚠ 型号未识别·估算可能偏差，建议校准」徽标；
+- 报告卡片同步展示该提示，引导用户校准。
+
+### W7 · `_find_key` 每次调用全表正则重归一化（182µs/次）
+- `power_model._find_key` 原地替换为 `find_key_v2`（预编译索引 + 按需后缀剥离），热路径不再每调用全表归一化；
+- 准确性测试不变（RTX 3060 Ti 不误判为 3060、RX 6800 XT 不误判为 6800 等）。
+
+---
+
 ## v18.29 — 源码内嵌 EXE（单一文件自包含源码）
 
 > 用户要求：把源码打包进 EXE 文件内部，而非单独附带一个源码 zip。

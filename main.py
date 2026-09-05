@@ -22,6 +22,16 @@ import shutil
 from ctypes import wintypes
 from datetime import datetime, timedelta
 from collections import deque
+import logging
+
+# v18.29+ W3：降级账本用的模块日志。未显式配置时由 logging 的 lastResort 处理打印到 stderr，
+# 保证静默异常至少有迹可循（不再「零信号」）。
+#
+# 静默异常三段式约定（对应审查报告 §1.2 W3）：
+#   ① 硬件探测类 —— 不允许静默：记日志 + 状态栏标注「部分硬件未识别」（见 _mark_degraded）。
+#   ② UI 刷新类   —— 允许静默，但必须就近加注释「已知：UI 刷新失败可忽略，不影响主流程」。
+#   ③ 落盘类     —— 不允许静默：必须留痕并给用户可见信号（见 _save_session / _load_session_maybe）。
+_log = logging.getLogger("pc_power_calc")
 
 from PySide6.QtCore import (Qt, QThread, QTimer, Signal, QElapsedTimer, QDateTime,
                             QEvent, QMarginsF, QSizeF)
@@ -42,6 +52,7 @@ from PySide6.QtGui import (QPainter, QFont, QColor, QAction, QPixmap, QIcon,
 
 import hardware as H
 import power_model as PM
+import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
 APP_VERSION = "v18.29"       # 界面标题/托盘提示展示的版本号
@@ -67,6 +78,23 @@ HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 # 永远无法启动。故用心跳文件判定持有者是否真活着：心跳过期即视为已死，允许接管。
 LOCK_FILE = os.path.join(BASE_DIR, "app.lock")
 LOCK_FRESH_SEC = 45.0      # 心跳新鲜阈值（心跳每 20s 写一次）
+
+# v18.29+ W5：设置字段单一真相源。新增设置只需在此加一行，
+# _save_session / _load_session_maybe 自动同步，不再「改两处手写」。
+# 仅收录「配置类」字段；运行期累计（energy_wh / hourly / samples 等）不在此列。
+_SETTINGS_SPEC = [
+    ("rate", DEFAULT_RATE), ("window_hours", WINDOW_HOURS), ("psu_eff", PM.PSU_EFFICIENCY),
+    ("psu_rating_w", 0.0), ("calib_k", 1.0), ("calib_idle", 0.0), ("calib_peak", 0.0),
+    ("price_mode", "单一"), ("rate_valley", 0.30), ("rate_flat", 0.56), ("rate_peak", 0.85),
+    ("tier_base", 0.0), ("tier_l1", 2160.0), ("tier_r1", 0.56),
+    ("tier_l2", 4800.0), ("tier_r2", 0.61), ("tier_r3", 0.86),
+    ("autostart_monitor", False), ("tou_valley", (23, 7)), ("tou_peak", [(8, 11), (18, 21)]),
+    ("alert_enabled", False), ("alert_threshold", 300.0),
+    ("budget_kwh", 0.0), ("budget_cost", 0.0),
+    ("budget_alert_enabled", False), ("budget_alert_pct", 90.0),
+    ("idle_cpu_thresh", 5.0), ("idle_gpu_thresh", 15.0),
+    ("idle_nudge_enabled", False), ("idle_nudge_min", 10.0),
+]
 
 # v18.28 真实显示器电源状态：注册 GUID_MONITOR_POWER_ON 通知，捕获 WM_POWERBROADCAST
 # 事件。之前仅靠「空闲时长 ≥ 系统熄屏超时」推断显示器是否熄灭，手动按显示器电源键关屏
@@ -596,8 +624,19 @@ class MainWindow(QMainWindow):
         self.resize(1080, 880)  # v18.17 收窄主界面（此前被内容顶到 1983px，最小 944）
         self.setStyleSheet(CSS)
 
+        # v18.29+ W3：降级账本（收敛静默异常，给维护者/用户可见信号）
+        self._degraded = set()
+        self._degraded_notes = {}
+
         # ---- 状态 ----
-        self.hw = H.detect_hardware()
+        # 硬件检测失败绝不能让整个程序崩溃：降级到空模板并登记账本
+        try:
+            self.hw = H.detect_hardware()
+        except Exception:
+            _log.exception("硬件检测失败，使用空模板继续运行")
+            self.hw = H.HardwareInfo()
+            self._degraded.add("hardware")
+            self._degraded_notes["hardware"] = "硬件检测失败·已用空模板(估算偏差大)"
         self.model = PM.build_model(self.hw)
         self.calib_k = 1.0
         self.calib_idle = 0.0
@@ -605,6 +644,57 @@ class MainWindow(QMainWindow):
         self.model.calib_k = self.calib_k
         self.model.calib_idle = self.calib_idle
         self.model.calib_peak = self.calib_peak
+        # v18.29+ W4：把 ~80 行属性默认值抽到 _init_defaults，__init__ 只保留骨架
+        self._init_defaults()
+
+        self._build_ui()
+        # v18 系统信息侧栏静态数据（一次性 WMI/注册表采集）
+        try:
+            self._sys_static = H.collect_system_info()
+        except Exception as _e:
+            self._sys_static = {}
+        self._load_session_maybe()
+        # v18 常驻监测：启动即开始，无需手动操作
+        if not self.finished:
+            self.running = True
+            self.last_ts = time.time()
+            self.status_lbl.setText("监测中…（后台常驻）")
+        # v18 开机自启默认开启（用户可在设置里关闭）
+        if not self.autostart:
+            try:
+                self.autostart = True
+                self._set_autostart(True)
+            except Exception:
+                pass
+        # v18 不占任务栏：作为工具窗口（托盘双击唤出）
+        try:
+            self.setWindowFlag(Qt.WindowType.Tool, True)
+        except Exception:
+            pass
+        self._setup_tray()
+        # v18.8 迷你悬浮窗：按会话恢复显示与位置
+        self.mini = MiniOverlay(on_top=getattr(self, '_mini_on_top', False),
+                            show_bd=getattr(self, '_mini_bd', True))
+        self.mini.hide()
+        if self._mini_visible:
+            if self._mini_pos:
+                self.mini.move(int(self._mini_pos[0]), int(self._mini_pos[1]))
+            else:
+                # v18.19 无历史位置：默认整个落在屏幕右侧 15% 区域
+                self.mini.place_right()
+            self.mini.show()
+            if self.tray is not None and getattr(self, "a_mini", None) is not None:
+                self.a_mini.setChecked(True)
+        self._start_worker()
+        # v18.11 心跳：证明本实例存活，避免被后续实例误判为僵尸
+        self._beat_timer = QTimer(self)
+        self._beat_timer.timeout.connect(_beat)
+        self._beat_timer.start(20000)
+        _beat()
+
+    # ---------------- UI ----------------
+    def _init_defaults(self):
+        """v18.29+ W4：从 __init__ 抽出的 ~80 行属性默认值，集中维护、便于阅读。"""
         self.rate = DEFAULT_RATE
         self.window_hours = WINDOW_HOURS
         self.psu_eff = PM.PSU_EFFICIENCY
@@ -689,52 +779,6 @@ class MainWindow(QMainWindow):
         self._monitor_phys_off = False
         self._monitor_hook_handle = None
 
-        self._build_ui()
-        # v18 系统信息侧栏静态数据（一次性 WMI/注册表采集）
-        try:
-            self._sys_static = H.collect_system_info()
-        except Exception as _e:
-            self._sys_static = {}
-        self._load_session_maybe()
-        # v18 常驻监测：启动即开始，无需手动操作
-        if not self.finished:
-            self.running = True
-            self.last_ts = time.time()
-            self.status_lbl.setText("监测中…（后台常驻）")
-        # v18 开机自启默认开启（用户可在设置里关闭）
-        if not self.autostart:
-            try:
-                self.autostart = True
-                self._set_autostart(True)
-            except Exception:
-                pass
-        # v18 不占任务栏：作为工具窗口（托盘双击唤出）
-        try:
-            self.setWindowFlag(Qt.WindowType.Tool, True)
-        except Exception:
-            pass
-        self._setup_tray()
-        # v18.8 迷你悬浮窗：按会话恢复显示与位置
-        self.mini = MiniOverlay(on_top=getattr(self, '_mini_on_top', False),
-                            show_bd=getattr(self, '_mini_bd', True))
-        self.mini.hide()
-        if self._mini_visible:
-            if self._mini_pos:
-                self.mini.move(int(self._mini_pos[0]), int(self._mini_pos[1]))
-            else:
-                # v18.19 无历史位置：默认整个落在屏幕右侧 15% 区域
-                self.mini.place_right()
-            self.mini.show()
-            if self.tray is not None and getattr(self, "a_mini", None) is not None:
-                self.a_mini.setChecked(True)
-        self._start_worker()
-        # v18.11 心跳：证明本实例存活，避免被后续实例误判为僵尸
-        self._beat_timer = QTimer(self)
-        self._beat_timer.timeout.connect(_beat)
-        self._beat_timer.start(20000)
-        _beat()
-
-    # ---------------- UI ----------------
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
@@ -1092,7 +1136,10 @@ class MainWindow(QMainWindow):
         L.append(f"<div style='margin-bottom:6px;'>{Y}主板型号{E} {g('mb') or '—'}</div>")
         L.append(f"<div style='margin-bottom:6px;'>{Y}主板Bios{E} Ver: {g('bios') or '—'}</div>")
         cpu_name = (g('cpu') or self.hw.cpu_name or "—").strip()
-        L.append(f"<div style='margin-bottom:2px;'>{Y}处 理 器{E} {cpu_name}</div>")
+        cpu_badge = (" <span style='color:#b8860b;font-weight:bold;'>"
+                     "⚠ 型号未识别·估算可能偏差，建议校准</span>"
+                     ) if getattr(self.model, "cpu_conf", "high") == "low" else ""
+        L.append(f"<div style='margin-bottom:2px;'>{Y}处 理 器{E} {cpu_name}{cpu_badge}</div>")
         L.append(f"<div style='margin:0 0 2px 46px;'>核心: {g('cores') or '—'} × 线程: "
                  f"{g('threads') or '—'}　频率: {mhz / 1000.0:.2f} GHz　{self._temp_html(cpu_t, 75, 85)}</div>")
         def kb2mb(v):
@@ -1120,8 +1167,11 @@ class MainWindow(QMainWindow):
                      f"DDR4/{m.get('clk') or m.get('spd') or '—'} {cap:.0f}GB</div>")
         L.append(f"<div style='margin:2px 0 2px 0;'>{Y}图形显示{E} {g('gpures') or '—'}\"　"
                  f"{g('gpuref') or '—'}Hz　DPI: {dpi}</div>")
+        gpu_badge = (" <span style='color:#b8860b;font-weight:bold;'>"
+                     "⚠ 型号未识别·估算可能偏差，建议校准</span>"
+                     ) if getattr(self.model, "gpu_conf", "high") == "low" else ""
         L.append(f"<div style='margin:0 0 8px 46px;'>{g('gpuname') or self.hw.gpu_name}　"
-                 f"{vram_txt}　{self._temp_html(gpu_t, 65, 78)}</div>")
+                 f"{vram_txt}　{self._temp_html(gpu_t, 65, 78)}{gpu_badge}</div>")
         dtemps = dyn.get("disk_temps") or {}
         for i, dk in enumerate(g('disks') or []):
             media = (dk.get("media") or "").upper()
@@ -1186,8 +1236,11 @@ class MainWindow(QMainWindow):
             m = PM.build_model(hw)
             try:
                 static = H.collect_system_info()
-            except Exception:
+            except Exception as e:
+                # v18.29+ W3：系统静态信息采集失败不应崩，但需登记降级
+                _log.warning("系统静态信息采集失败: %s", e)
                 static = None
+                self._mark_degraded("sysinfo", "系统信息采集失败·动态信息缺失")
         except Exception as e:
             QMessageBox.warning(self, "检测失败", f"重新检测硬件时出错：\n{e}")
             return
@@ -1216,6 +1269,7 @@ class MainWindow(QMainWindow):
         self.model.psu_efficiency = self.psu_eff
         if static:
             self._sys_static = static
+            self._clear_degraded("sysinfo")
         self._sys_tick = 0            # 强制下一次刷新立即重绘
         self._update_sysinfo()
 
@@ -2038,6 +2092,30 @@ class MainWindow(QMainWindow):
         fl.addRow("  峰1 起", p1s); fl.addRow("  峰1 止", p1e)
         fl.addRow("  峰2 起", p2s); fl.addRow("  峰2 止", p2e)
         fl.addRow(QLabel("  （平价=其余时段；起=止表示禁用该段）"))
+        # v18.29+ W4：把告警/预算/待机/自启/显示器等高级设置拆到独立方法，降低本方法体量
+        adv = self._build_advanced_settings_rows(fl)
+        fl.addRow(QLabel("<b>精度校准</b>"))
+        fl.addRow("单系数倍率", ck)
+        fl.addRow("实测待机功耗", cidle)
+        fl.addRow("实测满载功耗", cpeak)
+        save = QPushButton("保存设置"); save.clicked.connect(self._save_settings_panel)
+        row = QHBoxLayout(); row.addItem(QSpacerItem(20, 10, QSizePolicy.Expanding))
+        row.addWidget(save); fl.addRow(row)
+        vl.addWidget(form_w); vl.addStretch(1)
+        # 控件登记（_sync_settings_widgets / _save_settings_panel 读写用）
+        self._sw = {"rate": rate, "win": win, "eff": eff, "pr": pr, "samp": samp, "mode": mode,
+                    "tbase": tbase, "tl1": tl1, "tr1": tr1, "tl2": tl2, "tr2": tr2, "tr3": tr3,
+                    "rv": rv, "rf": rf, "rp": rp, "vsb": vsb, "veb": veb,
+                    "p1s": p1s, "p1e": p1e, "p2s": p2s, "p2e": p2e,
+                    "ck": ck, "cidle": cidle, "cpeak": cpeak}
+        self._sw.update(adv)
+        return panel
+
+    def _build_advanced_settings_rows(self, fl: QFormLayout) -> dict:
+        """v18.29+ W4：从 _build_settings_panel 抽出的高级设置分组（告警/预算/待机/自启/显示器）。
+
+        直接把行加进传入的 fl，并返回控件名->控件的映射，供主方法并入 self._sw。
+        """
         # 功耗告警
         al = QCheckBox("功耗超阈值告警（弹系统通知）")
         al.setChecked(self.alert_enabled)
@@ -2100,24 +2178,9 @@ class MainWindow(QMainWindow):
             "系统无法感知手动按显示器电源键关屏，需在此手动标记；\n"
             "标记为关闭后，一旦检测到键鼠操作会自动恢复按开启计。")
         fl.addRow("  显示器状态", disp_cb)
-        fl.addRow(QLabel("<b>精度校准</b>"))
-        fl.addRow("单系数倍率", ck)
-        fl.addRow("实测待机功耗", cidle)
-        fl.addRow("实测满载功耗", cpeak)
-        save = QPushButton("保存设置"); save.clicked.connect(self._save_settings_panel)
-        row = QHBoxLayout(); row.addItem(QSpacerItem(20, 10, QSizePolicy.Expanding))
-        row.addWidget(save); fl.addRow(row)
-        vl.addWidget(form_w); vl.addStretch(1)
-        # 控件登记（_sync_settings_widgets / _save_settings_panel 读写用）
-        self._sw = {"rate": rate, "win": win, "eff": eff, "pr": pr, "samp": samp, "mode": mode,
-                    "tbase": tbase, "tl1": tl1, "tr1": tr1, "tl2": tl2, "tr2": tr2, "tr3": tr3,
-                    "rv": rv, "rf": rf, "rp": rp, "vsb": vsb, "veb": veb,
-                    "p1s": p1s, "p1e": p1e, "p2s": p2s, "p2e": p2e,
-                    "al": al, "alth": alth, "bk": bk, "bc": bc, "bap": bap, "bal": bal,
-                    "ict": ict, "igt": igt, "inud": inud, "inm": inm,
-                    "au": au, "aum": aum, "ck": ck, "cidle": cidle, "cpeak": cpeak,
-                    "mini": mini_ck, "disp": disp_cb}
-        return panel
+        return {"al": al, "alth": alth, "bk": bk, "bc": bc, "bap": bap, "bal": bal,
+                "ict": ict, "igt": igt, "inud": inud, "inm": inm,
+                "au": au, "aum": aum, "mini": mini_ck, "disp": disp_cb}
 
     def _save_settings_panel(self):
         s = self._sw
@@ -2319,6 +2382,15 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
     def _build_report_html(self) -> str:
         kwh = self.energy_wh / 1000.0
         cost = self._current_cost()
+        # v18.29+ W3：报告内展示降级项，让用户知道哪些数据可能不准
+        deg = self._degraded_summary()
+        degraded_block = (
+            f"<div class='card' style='border-left:4px solid #b8860b;'>"
+            f"<div class='k' style='color:#b8860b;'>⚠ 部分功能已降级运行</div>"
+            f"<div style='font-size:12px;'>{deg}</div>"
+            f"<div style='font-size:11px;color:#8a93a6;margin-top:2px;'>"
+            f"上述相关数据可能不准确，建议检查硬件/权限或点「重新检测硬件」。</div></div>"
+        ) if deg else ""
         if self.price_mode == "峰谷":
             pblock = (
                 f"<div class='card'><div class='k'>峰谷分时电费明细</div>"
@@ -2450,17 +2522,7 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
         else:
             calib_note = "未做校准，电费按模型估算功耗计算。"
         # 小时柱图
-        keys = sorted(self.hourly.keys())
-        bars = ""
-        if keys:
-            maxv = max((self.hourly[k][0] / self.hourly[k][1]) for k in keys if self.hourly[k][1])
-            for k in keys:
-                s, n = self.hourly[k]
-                avg = s / n if n else 0
-                pct = (avg / maxv * 100) if maxv else 0
-        bars += (f"<div style='margin:2px 0;'><div style='font-size:10px;color:#555;'>{k} "
-                 f"· {avg:.0f}W</div><div style='background:#eef1f7;border-radius:2px;'>"
-                 f"<div style='width:{pct:.0f}%;background:#2f6bff;height:8px;border-radius:2px;'></div></div></div>")
+        bars = self._report_hourly_bars()
         bd = self.cur.get("breakdown", {})
         bd_rows = "".join(f"<tr><td>{k}</td><td style='text-align:right'>{v:.1f} W</td></tr>" for k, v in bd.items())
         return f"""
@@ -2480,6 +2542,7 @@ td{{padding:3px 4px;border-bottom:1px solid #eef1f7;}}
   <div class="box"><div class="k">平均插座功耗</div><div class="v">{avg_w:.0f} W</div></div>
   <div class="box"><div class="k">峰值插座功耗</div><div class="v">{self.peak_wall:.0f} W</div></div>
 </div>
+{degraded_block}
 <div class="card"><div class="k">本机配置</div>
   <div style="font-size:14px;line-height:1.7;margin-top:6px;">
   CPU：{self.hw.cpu_name}（{self.hw.cpu_cores}C/{self.hw.cpu_threads}T）<br>
@@ -2498,6 +2561,21 @@ td{{padding:3px 4px;border-bottom:1px solid #eef1f7;}}
 <div class="k" style="margin-top:10px;">注：台式机无墙插电表，GPU（N 卡）采用 nvidia-smi 真实读数，
 CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_note}</div>
 </body></html>"""
+
+    def _report_hourly_bars(self) -> str:
+        """v18.29+ W4：从 _build_report_html 抽出的逐小时平均功耗柱图 HTML。"""
+        keys = sorted(self.hourly.keys())
+        bars = ""
+        if keys:
+            maxv = max((self.hourly[k][0] / self.hourly[k][1]) for k in keys if self.hourly[k][1])
+            for k in keys:
+                s, n = self.hourly[k]
+                avg = s / n if n else 0
+                pct = (avg / maxv * 100) if maxv else 0
+                bars += (f"<div style='margin:2px 0;'><div style='font-size:10px;color:#555;'>{k} "
+                         f"· {avg:.0f}W</div><div style='background:#eef1f7;border-radius:2px;'>"
+                         f"<div style='width:{pct:.0f}%;background:#2f6bff;height:8px;border-radius:2px;'></div></div></div>")
+        return bars
 
     def _render_png(self, html: str, path: str, width: int = 960, scale: float = 2.0) -> bool:
         """把报告 HTML 渲染成 PNG 图片；成功返回 True，不弹任何对话框。
@@ -2631,31 +2709,54 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
             QMessageBox.critical(self, "导出失败", str(e))
 
     # ---------------- 会话持久化 ----------------
+    def _sync_settings_to_model(self):
+        """把配置类设置同步到功耗模型（电源效率/额定功率/校准），供 load 后统一调用（W5）。"""
+        self.model.psu_efficiency = self.psu_eff
+        self.model.psu_rating_w = self.psu_rating_w
+        self.model.calib_k = self.calib_k
+        self.model.calib_idle = self.calib_idle
+        self.model.calib_peak = self.calib_peak
+
+    # ---- v18.29+ W3：降级账本（收敛静默异常，给维护者/用户可见信号）----
+    def _mark_degraded(self, key, msg):
+        """登记一项降级（硬件/落盘/采集失败等）：记日志 + 状态区可见信号。"""
+        if key not in self._degraded:
+            _log.warning("降级项[%s]: %s", key, msg)
+        self._degraded.add(key)
+        self._degraded_notes[key] = msg
+        self._refresh_degraded_status()
+
+    def _clear_degraded(self, key):
+        if key in self._degraded:
+            self._degraded.discard(key)
+            self._degraded_notes.pop(key, None)
+            self._refresh_degraded_status()
+
+    def _degraded_summary(self):
+        if not self._degraded:
+            return ""
+        return "；".join(self._degraded_notes.get(k, k) for k in sorted(self._degraded))
+
+    def _refresh_degraded_status(self):
+        """把降级项展示在硬件检测标签上（状态栏可见信号）。标签未建好时仅更新账本。"""
+        lbl = getattr(self, "_hw_detect_lbl", None)
+        if lbl is None:
+            return
+        if self._degraded:
+            lbl.setText(f"⚠ 部分功能降级：{self._degraded_summary()}")
+            lbl.setStyleSheet("font-size:11px;color:#b8860b;")
+            lbl.setToolTip("检测到异常但已降级运行；详见日志")
+        else:
+            lbl.setStyleSheet("font-size:11px;color:#8a94a6;")
+
     def _save_session(self):
         try:
             data = {
                 "energy_wh": self.energy_wh, "peak_wall": self.peak_wall,
                 "running_elapsed_ms": self.running_elapsed_ms, "running": self.running,
-                "finished": self.finished,                 "rate": self.rate, "window_hours": self.window_hours,
-                "psu_eff": self.psu_eff, "sample_ms": self.sample_ms,
-                "psu_rating_w": float(getattr(self, "psu_rating_w", 0.0) or 0.0),
-                "calib_k": self.calib_k, "calib_idle": self.calib_idle,
-                "calib_peak": self.calib_peak,
-                "price_mode": self.price_mode, "rate_valley": self.rate_valley,
-                "rate_flat": self.rate_flat, "rate_peak": self.rate_peak,
-                "tier_base": self.tier_base, "tier_l1": self.tier_l1, "tier_r1": self.tier_r1,
-                "tier_l2": self.tier_l2, "tier_r2": self.tier_r2, "tier_r3": self.tier_r3,
+                "finished": self.finished,                 # v18.29+ W5：配置字段统一经 _SETTINGS_SPEC 写入，新增设置只改 spec 一处
+                "sample_ms": self.sample_ms,
                 "period_energy_wh": self.period_energy_wh,
-                "autostart_monitor": self.autostart_monitor,
-                "tou_valley": list(self.tou_valley), "tou_peak": [list(x) for x in self.tou_peak],
-                "alert_enabled": self.alert_enabled, "alert_threshold": self.alert_threshold,
-                "budget_kwh": self.budget_kwh, "budget_cost": self.budget_cost,
-                "budget_alert_enabled": self.budget_alert_enabled,
-                "budget_alert_pct": self.budget_alert_pct,
-                "idle_cpu_thresh": self.idle_cpu_thresh,
-                "idle_gpu_thresh": self.idle_gpu_thresh,
-                "idle_nudge_enabled": self.idle_nudge_enabled,
-                "idle_nudge_min": self.idle_nudge_min,
                 "idle_energy_wh": self.idle_energy_wh,
                 "active_energy_wh": self.active_energy_wh,
                 "ts": time.time(),
@@ -2675,6 +2776,16 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 "disp_saved_wh": self._disp_saved_wh,
                 "samples": list(self.all_samples)[-2000:],
             }
+            # v18.29+ W5：配置字段统一经 _SETTINGS_SPEC 写入，新增设置只改 spec 一处
+            for k, _ in _SETTINGS_SPEC:
+                v = getattr(self, k)
+                if k == "psu_rating_w":
+                    v = float(v or 0.0)
+                elif k == "tou_valley":
+                    v = list(self.tou_valley)
+                elif k == "tou_peak":
+                    v = [list(x) for x in self.tou_peak]
+                data[k] = v
             with open(SESSION_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f)
         except Exception as e:
@@ -2683,6 +2794,8 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 print(f"[session] 保存失败: {e!r}")
             except Exception:
                 pass
+            # v18.29+ W3：落盘类失败必须给用户可见信号，否则配置悄悄丢失
+            self._mark_degraded("session_save", "会话保存失败·配置可能未持久化")
 
     def _load_session_maybe(self):
         if not os.path.exists(SESSION_FILE):
@@ -2690,7 +2803,10 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         try:
             with open(SESSION_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
-        except Exception:
+        except Exception as e:
+            # v18.29+ W3：落盘类失败须留痕（此前完全静默，旧会话被悄悄丢弃）
+            _log.warning("会话文件解析失败，已忽略旧会话: %s", e)
+            self._mark_degraded("session_load", "旧会话读取失败·已重置")
             return
         age = time.time() - d.get("ts", 0)
         if age > (d.get("window_hours", WINDOW_HOURS) * 3600 + 3600):
@@ -2701,47 +2817,21 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         self.energy_wh = d.get("energy_wh", 0.0)
         self.peak_wall = d.get("peak_wall", 0.0)
         self.running_elapsed_ms = d.get("running_elapsed_ms", 0.0)
-        self.rate = d.get("rate", DEFAULT_RATE)
-        self.window_hours = d.get("window_hours", WINDOW_HOURS)
-        self.psu_eff = d.get("psu_eff", PM.PSU_EFFICIENCY)
-        self.model.psu_efficiency = self.psu_eff
-        # v18.11 电源额定功率（>0 启用 80 PLUS 动态效率曲线）
-        self.psu_rating_w = float(d.get("psu_rating_w", 0.0) or 0.0)
-        self.model.psu_rating_w = self.psu_rating_w
-        self.calib_k = d.get("calib_k", 1.0)
-        self.calib_idle = d.get("calib_idle", 0.0)
-        self.calib_peak = d.get("calib_peak", 0.0)
-        self.model.calib_k = self.calib_k
-        self.model.calib_idle = self.calib_idle
-        self.model.calib_peak = self.calib_peak
-        self.rate_valley = d.get("rate_valley", 0.30)
-        self.rate_flat = d.get("rate_flat", 0.56)
-        self.rate_peak = d.get("rate_peak", 0.85)
-        self.price_mode = d.get("price_mode", "单一")
-        self.tier_base = d.get("tier_base", 0.0)
-        self.tier_l1 = d.get("tier_l1", 2160.0)
-        self.tier_r1 = d.get("tier_r1", 0.56)
-        self.tier_l2 = d.get("tier_l2", 4800.0)
-        self.tier_r2 = d.get("tier_r2", 0.61)
-        self.tier_r3 = d.get("tier_r3", 0.86)
+        # v18.29+ W5：配置字段统一经 _SETTINGS_SPEC 读取，新增设置只改 spec 一处
+        for k, default in _SETTINGS_SPEC:
+            v = d.get(k, default)
+            if k == "psu_rating_w":
+                v = float(v or 0.0)
+            elif k == "tou_valley":
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    v = (int(v[0]), int(v[1]))
+            elif k == "tou_peak":
+                if isinstance(v, list):
+                    v = [(int(a), int(b)) for a, b in v]
+            setattr(self, k, v)
+        self._sync_settings_to_model()   # 把配置同步进功耗模型（效率/校准/额定功率）
+        # 运行期累计（非配置），保持显式
         self.period_energy_wh = d.get("period_energy_wh", {"谷": 0.0, "平": 0.0, "峰": 0.0})
-        self.autostart_monitor = d.get("autostart_monitor", False)
-        v = d.get("tou_valley")
-        if isinstance(v, (list, tuple)) and len(v) == 2:
-            self.tou_valley = (int(v[0]), int(v[1]))
-        pk = d.get("tou_peak")
-        if isinstance(pk, list):
-            self.tou_peak = [(int(a), int(b)) for a, b in pk]
-        self.alert_enabled = d.get("alert_enabled", False)
-        self.alert_threshold = d.get("alert_threshold", 300.0)
-        self.budget_kwh = d.get("budget_kwh", 0.0)
-        self.budget_cost = d.get("budget_cost", 0.0)
-        self.budget_alert_enabled = d.get("budget_alert_enabled", False)
-        self.budget_alert_pct = d.get("budget_alert_pct", 90.0)
-        self.idle_cpu_thresh = d.get("idle_cpu_thresh", 5.0)
-        self.idle_gpu_thresh = d.get("idle_gpu_thresh", 15.0)
-        self.idle_nudge_enabled = d.get("idle_nudge_enabled", False)
-        self.idle_nudge_min = d.get("idle_nudge_min", 10.0)
         self.idle_energy_wh = d.get("idle_energy_wh", 0.0)
         self.active_energy_wh = d.get("active_energy_wh", 0.0)
         self.hourly = d.get("hourly", {})
@@ -2955,24 +3045,27 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
             parent_dialog.accept()
 
     # ---------------- 节能情景模拟 ----------------
+    def _billing_settings_dict(self) -> dict:
+        """导出计费相关设置，供 PowerEngine.from_settings_dict 构造引擎（单一真相源）。"""
+        d = {}
+        for k in PC.PowerEngine.BILLING_KEYS:
+            v = getattr(self, k, None)
+            d[k] = list(v) if isinstance(v, (tuple, list)) else v
+        return d
+
     def _simulate(self, hours_off: float, target_eff: float) -> dict:
-        """基于本次监测的平均功耗与当前计费方式，估算两种节能情景的月省电量/电费。"""
-        elapsed_h = max(self.running_elapsed_ms / 3_600_000.0, 1e-9)
-        avg_w = (self.energy_wh / elapsed_h) if (self.energy_wh > 0 and elapsed_h > 1e-6) else (self.cur["wall"] or 0.0)
-        kwh_total = self.energy_wh / 1000.0
-        blended = (self._current_cost() / kwh_total) if kwh_total > 0 else self.rate
-        # v18.11：开了动态效率曲线时，用当前实时效率作为基准
-        eff_old = self.cur.get("psu_eff") or self.psu_eff
-        # 情景1：每天完全关机 hours_off 小时（那段时间零耗电），按当前平均功耗近似
-        sa_kwh = avg_w * hours_off / 1000.0 * 30.0
-        sa = sa_kwh * blended
-        # 情景2：电源效率从 eff_old 提升到 target_eff（系统功耗不变，插座功耗下降）
-        wall_month = avg_w * 720.0 / 1000.0
-        sys_month = wall_month * eff_old
-        sb_kwh = sys_month * (1.0 / eff_old - 1.0 / target_eff) if target_eff > 0 else 0.0
-        sb = sb_kwh * blended
-        return {"avg_w": avg_w, "blended": blended, "wall_month": wall_month,
-                "sa_kwh": sa_kwh, "sa": sa, "sb_kwh": sb_kwh, "sb": sb}
+        """基于本次监测的平均功耗与当前计费方式，估算两种节能情景的月省电量/电费。
+
+        v18.29+：委托给 power_core.PowerEngine.simulate（消除双实现漂移，见审查报告 §5.2）。
+        引擎用本会话的累计电量与当前计费配置构造，结果与原本地计算逐项一致（有 parity 测试守护）。
+        """
+        eng = PC.PowerEngine.from_settings_dict(self.model, self._billing_settings_dict())
+        eng.energy_wh = self.energy_wh
+        eng.running_elapsed_ms = self.running_elapsed_ms
+        cur = self.cur or {}
+        cur_psu_eff = cur.get("psu_eff")
+        cur_wall = cur.get("wall") or 0.0
+        return eng.simulate(hours_off, target_eff, cur_psu_eff=cur_psu_eff, cur_wall=cur_wall)
 
     def open_sim(self):
         """节能情景模拟：输入「每天可关机时长」「目标电源效率」，实时算出月省电量与电费。"""

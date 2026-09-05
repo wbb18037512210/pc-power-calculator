@@ -33,6 +33,7 @@ EMBED_DATAS = [("_src_bundle", "src")]
 # 顶层文件白名单（精确）
 INCLUDE_FILES = [
     "main.py", "hardware.py", "power_model.py", "power_core.py",
+    "hardware_id_v2.py",
     "build_exe.bat", "kill_instances.py", "package_source.py",
     "README.md", "CHANGELOG.md", "test_headless.py", ".gitignore",
 ]
