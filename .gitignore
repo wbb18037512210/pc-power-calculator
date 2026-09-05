@@ -23,10 +23,13 @@ app.lock
 用电日报_*.html
 用电报告_*.html
 PC用电汇总.html
-# PDF 报告同样是运行期导出物，不入版本库
+# 报告导出物（PDF 已废弃；PNG 为当前格式）均不入版本库
 用电日报_*.pdf
 用电报告_*.pdf
 PC用电汇总.pdf
+用电日报_*.png
+用电报告_*.png
+PC用电汇总.png
 
 # 诊断脚本 / 数据备份
 _savedata/

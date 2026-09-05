@@ -5,6 +5,19 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.26 — 报告导出从 PDF 改为 PNG 图片
+
+### 导出格式切换为 PNG
+- 用户需求：把「PC用电汇总」导出从 PDF 改成 PNG 图片，便于直接贴图/分享。
+- 把原有 `QTextDocument + QPrinter(PdfFormat)` 渲染链路替换为 `QTextDocument + QImage`：
+  - 同一套 HTML 解析引擎，版式与旧 PDF 完全一致；
+  - 渲染宽度 860px、2× 超采样（1720px 逻辑宽），得到清晰的视网膜级图片；
+  - 移除 `QtPrintSupport`/`QPrinter`/`QPageLayout`/`QPageSize` 依赖，进一步降低打包负担。
+- 导出按钮与汇总弹窗主按钮文案统一改为「保存报告(PNG)」，默认文件名 `PC用电汇总.png`。
+- HTML 导出继续保留作为「可二次排版」的备用格式。
+- 自动归档报告同样改为 PNG：`用电报告_{时间戳}.png`。
+- `.gitignore` 同步增加 PNG 报告忽略规则，并清理已废弃的 PDF 导入。
+
 ## v18.25 — 悬浮窗盘温度占位符顺序修复
 
 - 实机截图发现第二块盘显示「盘2°36」（`%s` 参数顺序写反）→ 改为「盘2 37°」。

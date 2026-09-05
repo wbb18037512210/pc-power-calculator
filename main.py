@@ -33,16 +33,15 @@ from PySide6.QtWidgets import (
 from PySide6.QtCharts import (QChart, QChartView, QLineSeries, QValueAxis,
                               QBarSeries, QBarSet, QBarCategoryAxis, QDateTimeAxis)
 from PySide6.QtGui import (QPainter, QFont, QColor, QAction, QPixmap, QIcon,
-                           QTextDocument, QPageLayout, QPageSize)
-# v18.15 报告导出 PDF：QtPrintSupport 本就在 PyInstaller 默认依赖里，
-# 相比 QWebEngine（+100MB）或 reportlab（第三方）成本最低。
-from PySide6.QtPrintSupport import QPrinter
+                           QTextDocument)
+# v18.26 报告导出 PNG：沿用 QTextDocument 引擎直接画到 QImage，纯 Qt、完全离线，
+# 相比 QWebEngine（+100MB）或 reportlab（第三方）成本最低，也不依赖 QtPrintSupport。
 
 import hardware as H
 import power_model as PM
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.25"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.26"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 2000
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -1199,7 +1198,7 @@ class MainWindow(QMainWindow):
         # v18：始终监测，移除「开始监测」按钮
         self.btn_reset = QPushButton("重置"); self.btn_reset.setObjectName("ghost")
         self.btn_reset.clicked.connect(self.reset_session)
-        self.btn_export = QPushButton("导出报告(PDF)"); self.btn_export.setObjectName("ghost")
+        self.btn_export = QPushButton("导出报告(PNG)"); self.btn_export.setObjectName("ghost")
         self.btn_export.clicked.connect(self.export_report)
         self.btn_csv = QPushButton("导出CSV"); self.btn_csv.setObjectName("ghost")
         self.btn_csv.clicked.connect(self.export_csv)
@@ -2170,9 +2169,9 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
         if auto:
             # v18 后台常驻：到点自动归档、报告落盘、无缝开启新一轮（不弹窗打断）
             try:
-                # v18.15 自动归档也直接落 PDF（此前是 HTML）
-                out = os.path.join(BASE_DIR, f"用电报告_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf")
-                if not self._render_pdf(html, out):
+                # v18.26 自动归档也直接落 PNG 图片（此前是 PDF）
+                out = os.path.join(BASE_DIR, f"用电报告_{datetime.now().strftime('%Y%m%d_%H%M')}.png")
+                if not self._render_png(html, out):
                     out = ""
             except Exception:
                 out = ""
@@ -2194,10 +2193,10 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
         # 是 exe 膨胀到 206MB 的绝对大头，已移除。
         view = QTextBrowser(); view.setHtml(html)
         vl.addWidget(view, 1)
-        # v18.15 主按钮改为 PDF；HTML 保留作为备用（可二次排版/贴进文档）
+        # v18.26 主按钮改为 PNG（图片，可直接贴图/分享）；HTML 保留作为备用（可二次排版/贴进文档）
         row = QHBoxLayout()
-        bt = QPushButton("保存报告(PDF)"); bt.setObjectName("primary")
-        bt.clicked.connect(lambda: self._save_pdf(html))
+        bt = QPushButton("保存报告(PNG)"); bt.setObjectName("primary")
+        bt.clicked.connect(lambda: self._save_png(html))
         bt2 = QPushButton("保存报告(HTML)"); bt2.setObjectName("ghost")
         bt2.clicked.connect(lambda: self._save_html(html))
         bt3 = QPushButton("关闭"); bt3.setObjectName("ghost")
@@ -2389,36 +2388,37 @@ td{{padding:6px 4px;border-bottom:1px solid #eef1f7;}}
 CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_note}</div>
 </body></html>"""
 
-    def _render_pdf(self, html: str, path: str) -> bool:
-        """把报告 HTML 渲染成 PDF 文件；成功返回 True，不弹任何对话框。
+    def _render_png(self, html: str, path: str, width: int = 860, scale: float = 2.0) -> bool:
+        """把报告 HTML 渲染成 PNG 图片；成功返回 True，不弹任何对话框。
 
-        用 QTextDocument + QPrinter(PdfFormat) 直接打印到 PDF：
-        · 纯 Qt，无需 reportlab / wkhtmltopdf 之类外部依赖，完全离线；
-        · 相比 QWebEngineView 不会让 exe 膨胀 100MB+；
-        · 指定 Microsoft YaHei，中文字形正常（宋体回退也能显示）。
+        沿用 QTextDocument 引擎（与旧版 _render_pdf 同一套 HTML 解析），只是输出
+        目标从 QPrinter(PdfFormat) 换成 QImage——因此版式与旧 PDF 完全一致，但得到
+        一张可直接贴图 / 分享的图片。纯 Qt，完全离线，也不会让 exe 膨胀。
+
+        width 为报告逻辑宽度（px），scale 为超采样倍数（2 => 视网膜级清晰度）。
         """
         try:
+            from PySide6.QtGui import QPainter, QImage, QColor
             doc = QTextDocument()
             doc.setDefaultFont(QFont("Microsoft YaHei", 10))
             doc.setHtml(html)
-            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-            printer.setOutputFileName(path)
-            # Qt6 移除了 QPrinter.PageSize，页面尺寸统一走 QPageSize。
-            # 排版参数失败不该让整个导出挂掉，所以单独兜住。
-            try:
-                printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-                printer.setPageMargins(QMarginsF(14, 14, 14, 14),
-                                       QPageLayout.Unit.Millimeter)
-                # 让文档按打印机的可打印区域排版，分页才正确
-                doc.setPageSize(QSizeF(printer.pageRect(QPrinter.Unit.DevicePixel).size()))
-            except Exception:
-                pass
-            doc.print_(printer)
-            return os.path.exists(path) and os.path.getsize(path) > 0
+            doc.setTextWidth(width)
+            size = doc.size()
+            w, h = int(size.width()), int(size.height())
+            if w <= 0 or h <= 0:
+                return False
+            img = QImage(int(w * scale), int(h * scale), QImage.Format_ARGB32)
+            img.fill(QColor("#f4f6f9"))      # 与报告 body 底色一致
+            painter = QPainter(img)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            painter.scale(scale, scale)
+            doc.drawContents(painter)
+            painter.end()
+            return img.save(path, "PNG")
         except Exception as e:
             try:
-                print("[pdf] 渲染失败: %r" % (e,))
+                print("[png] 渲染失败: %r" % (e,))
             except Exception:
                 pass
             return False
@@ -2430,26 +2430,26 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 f.write(html)
             QMessageBox.information(self, "已保存", f"报告已保存到：\n{path}")
 
-    def _save_pdf(self, html: str) -> bool:
-        """弹出保存对话框，把当前报告导出为 PDF。"""
+    def _save_png(self, html: str) -> bool:
+        """弹出保存对话框，把当前报告导出为 PNG 图片。"""
         path, _ = QFileDialog.getSaveFileName(
-            self, "保存报告(PDF)", "PC用电汇总.pdf", "PDF 文档 (*.pdf)")
+            self, "保存报告(PNG)", "PC用电汇总.png", "PNG 图片 (*.png)")
         if not path:
             return False
-        if not path.lower().endswith(".pdf"):
-            path += ".pdf"
-        ok = self._render_pdf(html, path)
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        ok = self._render_png(html, path)
         if ok:
-            QMessageBox.information(self, "已保存", f"PDF 报告已保存到：\n{path}")
+            QMessageBox.information(self, "已保存", f"PNG 报告已保存到：\n{path}")
         else:
             QMessageBox.warning(self, "导出失败",
-                                "PDF 未能生成，请确认路径可写后重试。")
+                                "PNG 未能生成，请确认路径可写后重试。")
         return ok
 
     def export_report(self):
-        """v18.15 起「导出报告」直接输出 PDF（旧版是 HTML）。"""
+        """v18.26 起「导出报告」直接输出 PNG 图片（旧版是 PDF）。"""
         html = self._build_report_html()
-        self._save_pdf(html)
+        self._save_png(html)
 
     def open_compare(self):
         """同一份累计数据，对比「单一电价」与「峰谷电价」两种方案的电费差异。"""
