@@ -5,6 +5,34 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.30 — 修复「历史趋势」点击无反应 + 全局异常可见化
+
+> 现象：点击「历史趋势」按钮毫无反应（无弹窗、无报错）。
+
+### 根因
+`open_history()` 中对 `QBarSeries` 调用了 `setColor()`，而 **PySide6 里 `setColor` 只存在于 `QBarSet`，
+`QBarSeries` 没有该方法** → 抛 `AttributeError`。程序以 `--windowed` 打包、**没有控制台**，
+异常被静默吞掉，用户侧只剩「点了没反应」。
+
+### 修复
+1. **柱状图配色**改为 `bar_set.setColor(QColor("#2f6bff"))`（作用在 QBarSet 上），图表双轴（柱=用电量 kWh / 折线=电费 ¥）恢复正常。
+2. **新增全局异常钩子 `_install_excepthook()`**（`main()` 首行安装）：
+   未捕获异常 → 写 `_log` + 打 stderr + 有 QApplication 时弹一次错误框（15 秒自动关闭）。
+   根治「窗口化运行下槽函数异常 = 静默无反应」这一整类问题。
+3. **新增 `tests/test_ui_slots.py`**：逐个冒烟 9 个弹窗/操作类槽函数
+   （`open_history / open_hourly / open_apps / open_compare / open_sim / open_settings /
+   export_csv / export_report / _save_settings_panel`），任何异常即 Fail，防止同类回归。
+   - 支持单槽运行：`python tests/test_ui_slots.py open_history`（便于外部 timeout 隔离定位）
+   - `--all` 追加 `_redetect_hardware`（依赖 WMI，较慢，默认跳过）
+   - 坑记录：`QMessageBox.information/critical` 是 **C++ 静态方法**，走 C++ 的 `exec()`，
+     仅 patch `QMessageBox.exec` 拦不住，必须连静态方法一起替换，否则测试会真起模态循环卡死。
+
+### 验证
+- `tests/test_ui_slots.py` → `UI_SLOT_SMOKE_OK (9 slots)`
+- `test_core`(12) / `test_parity` / `test_monitor_hook` / `test_degraded` / `test_headless` 全绿
+
+---
+
 ## v18.29 — 代码审查报告 §1.2 主要不足(W) 全部修复
 
 > 用户要求：依据 `代码审查评估报告_v18.29.md` 的「1.2 主要不足(W)」，**全部解决** 7 项弱点。

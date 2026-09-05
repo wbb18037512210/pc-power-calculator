@@ -19,6 +19,7 @@ import time
 import threading
 import ctypes
 import shutil
+import traceback
 from ctypes import wintypes
 from datetime import datetime, timedelta
 from collections import deque
@@ -55,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.29"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.30"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 2000
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -2923,6 +2924,9 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         cats = [r["date"].replace(" ", "\n") for r in recent]
         # 双轴图：柱=用电量 kWh，折线=电费 ¥
         bar_set = QBarSet("用电量 kWh")
+        # v18.30 修复：QBarSeries 没有 setColor（只有 QBarSet 有），旧写法抛 AttributeError，
+        # 窗口化运行时无控制台 → 异常被静默吞掉，表现为「点历史趋势没反应」。
+        bar_set.setColor(QColor("#2f6bff"))
         line_series = QLineSeries()
         line_series.setName("电费 ¥")
         line_series.setColor(QColor("#ff8a3d"))
@@ -2933,7 +2937,6 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
 
         bars = QBarSeries()
         bars.append(bar_set)
-        bars.setColor(QColor("#2f6bff"))
         chart = QChart()
         chart.addSeries(bars)
         chart.addSeries(line_series)
@@ -3528,7 +3531,42 @@ def _acquire_single_instance(mutex_name: str = "PC用电电费计算器_SingleIn
     return True
 
 
+def _install_excepthook():
+    """v18.30：窗口化运行（--windowed）没有控制台，槽函数里的异常会被静默吞掉，
+    用户侧表现为「点了按钮没反应」（本版历史趋势即因此失效未被发现）。
+    这里把未捕获异常同时写日志 + 弹一次错误框，让故障立即可见（同 W3 目标）。"""
+    def _hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        try:
+            _log.error("未捕获异常：\n%s", text)
+        except Exception:
+            pass
+        try:
+            print("[uncaught]", text, file=sys.stderr)
+        except Exception:
+            pass
+        try:
+            from PySide6.QtWidgets import QApplication, QMessageBox
+            if QApplication.instance() is not None:
+                box = QMessageBox(
+                    QMessageBox.Icon.Critical, "程序异常",
+                    f"发生未捕获异常，本次操作可能未生效：\n\n"
+                    f"{exc_type.__name__}: {exc}\n\n（详情已写入日志，15 秒后自动关闭）",
+                    QMessageBox.StandardButton.Ok)
+                box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+                QTimer.singleShot(15000, box.close)
+                box.exec()
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc, tb)
+    sys.excepthook = _hook
+
+
 def main():
+    _install_excepthook()
     if not _acquire_single_instance():
         # 已有实例在后台监测：提示后退出，避免多实例争抢 session.json / 重复托盘图标。
         # v18.13：原写法是静态模态框，无人点确定就会永远挂着（用户熄屏时尤其容易发生），
