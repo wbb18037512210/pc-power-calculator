@@ -31,6 +31,9 @@ if exist "build\build" (
   if exist "build\_old_build_!TS!" (echo     已挪走) else (echo     警告: 挪走失败，可能被占用)
 )
 
+echo ==^> [prepare] Bundle source for embedding into exe
+"%PY%" package_source.py --bundle-dir _src_bundle
+
 echo ==^> [4/6] PyInstaller 打包中…
 "%PY%" -m PyInstaller --noconfirm --onefile --windowed ^
   --name "%NAME%" ^
@@ -76,14 +79,17 @@ echo ==^> [4/6] PyInstaller 打包中…
   --exclude-module PySide6.QtStateMachine ^
   --exclude-module PySide6.QtRemoteObjects ^
   --exclude-module PySide6.QtNetworkAuth ^
+  --add-data "_src_bundle;src" ^
   main.py
 set "BUILD_EXIT=%ERRORLEVEL%"
 echo BUILD_EXIT=%BUILD_EXIT%
 
 echo ==^> [5/6] 产物改名为「项目名+版本号」并清理旧版本
 set "VER="
-for /f "usebackq tokens=2" %%a in (`findstr /C:"APP_VERSION = " main.py`) do set "VER=%%a"
+for /f "usebackq tokens=2 delims==" %%a in (`findstr /C:"APP_VERSION = " main.py`) do set "VER=%%a"
+for /f "delims=#" %%b in ("!VER!") do set "VER=%%b"
 set "VER=!VER:"=!"
+set "VER=!VER: =!"
 if "%BUILD_EXIT%"=="0" if exist "release\%NAME%.exe" (
   if defined VER (
     move /y "release\%NAME%.exe" "release\%NAME%_!VER!.exe" >nul
@@ -117,6 +123,9 @@ if defined VER (
     echo     部署失败，请手动从 release\ 复制
   )
 )
+
+echo ==^> [7/7] Clean temp source bundle
+if exist "_src_bundle" rmdir /s /q "_src_bundle"
 
 :end
 echo.

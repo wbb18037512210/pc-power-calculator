@@ -5,6 +5,44 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.29 — 源码内嵌 EXE（单一文件自包含源码）
+
+> 用户要求：把源码打包进 EXE 文件内部，而非单独附带一个源码 zip。
+
+### 实现
+- 新增 `package_source.py`：白名单收集可重建工程所需的源文件（main/hardware/power_model/power_core、
+  build_exe.bat/kill_instances.py/README/CHANGELOG/tests/），排除 `_probe_*`、`_diag_*` 等调试脚本与
+  构建产物；支持 `--bundle-dir`（复制到目录供嵌入）与 `--out/--ver`（生成独立 zip 两种模式）。
+- `build_exe.bat` 在 PyInstaller 前调用 `package_source.py --bundle-dir _src_bundle`，
+  并以 `--add-data "_src_bundle;src"` 把源码整体打进 onefile exe；打包结束后清理临时目录。
+- 主窗口新增「导出源码（内嵌于 EXE）」托盘菜单项（`_export_source`）：运行时从
+  `sys._MEIPASS/src` 读取内嵌源码并原样导出到用户所选目录；开发 / onedir 下回退到 `BASE_DIR` 真实源码。
+- 进程内源码以 `src/` 子目录形式随 exe 自包含，单文件即可携带全部源码，无需额外附件。
+
+### 注意
+- 内嵌源码体积约 110 KB，对 49 MB 的 exe 体积影响可忽略。
+- 后续仍可用 `python package_source.py` 单独生成 `release/<名>_源码_<ver>.zip` 以手动分发。
+
+### 独立提取小程序（SourceExtractor）
+- 新增 `extract_source.py`：仅用标准库（struct / zlib / ctypes）自带一个极简 PyInstaller
+  CArchive(PKG) 读取器，从主 exe 的归档中解析并提取 `src/...` 条目；不依赖 PySide6 / 完整
+  PyInstaller，因此可单独打包成体积极小的 exe（约 7.5 MB）。
+- 配套 `build_extractor.bat`：`--onefile --windowed`，剔除 PySide6 / PyQt / tkinter / numpy / PIL
+  等重型依赖，产物 `SourceExtractor.exe` 部署到桌面。
+- 用法：双击自动在同目录查找「PC用电电费计算器*.exe」并提取到 `<主名>_源码`；也支持命令行
+  `SourceExtractor.exe <主程序exe> [输出目录] --silent`，或把主 exe 拖到本工具上。
+- 验证：用官方 `CArchiveReader` 做逐字节比对，v18.29.exe 内嵌的 15 个源码条目（含修正后的主 spec）
+  与仓库源文件 **15/15 逐字节一致**。
+
+### 构建脚本修复
+- `build_exe.bat` 版本解析由 `tokens=2`（默认分隔符含 `=`，会把 `APP_VERSION = "v18.29" # 注释`
+  的第 2 个 token 误取为 `=`）改为 `tokens=2 delims==` 并增加 `delims=#` 截断行尾注释，
+  使产物稳定命名为 `PC用电电费计算器_v18.29.exe`（此前曾误命名为 `_=.exe` / 含注释乱码）。
+- `package_source.py` 在打包快照时把主 spec 的 `datas` 规范化为含 `('_src_bundle','src')`，
+  保证从提取出的源码重新 `pyinstaller PC用电电费计算器.spec` 仍可复现内嵌构建。
+
+---
+
 ## v18.28 — 真实显示器电源状态识别（修「显示器关闭后仍无法识别」）
 
 > 用户反馈：手动按显示器电源键关屏后，程序仍记成「显示器开启」、照常计 30W。

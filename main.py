@@ -18,6 +18,7 @@ import json
 import time
 import threading
 import ctypes
+import shutil
 from ctypes import wintypes
 from datetime import datetime, timedelta
 from collections import deque
@@ -43,7 +44,7 @@ import hardware as H
 import power_model as PM
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.28"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.29"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 2000
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -3285,6 +3286,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         a_toggle = menu.addAction("开始 / 暂停监测"); a_toggle.triggered.connect(self.toggle_run)
         a_csv = menu.addAction("导出 CSV"); a_csv.triggered.connect(self.export_csv)
         a_report = menu.addAction("导出报告"); a_report.triggered.connect(self.export_report)
+        a_src = menu.addAction("导出源码（内嵌于 EXE）"); a_src.triggered.connect(self._export_source)
         a_hist = menu.addAction("历史趋势"); a_hist.triggered.connect(self.open_history)
         a_sim = menu.addAction("节能模拟"); a_sim.triggered.connect(self.open_sim)
         a_apps = menu.addAction("软件耗电"); a_apps.triggered.connect(self.open_apps)
@@ -3325,6 +3327,47 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 self.hide()
             else:
                 self._show_window()
+
+    def _export_source(self):
+        """把内嵌在 exe 里的源码导出到用户选择的目录。
+        PyInstaller onefile 运行时源码在 sys._MEIPASS/src；开发 / onedir 下回退到 BASE_DIR 真实源码目录。
+        托盘菜单「导出源码（内嵌于 EXE）」入口。"""
+        src_root = None
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass and os.path.isdir(os.path.join(meipass, "src")):
+            src_root = os.path.join(meipass, "src")
+        elif os.path.isdir(BASE_DIR):
+            src_root = BASE_DIR
+        if not src_root:
+            QMessageBox.warning(self, "导出失败", "未找到可导出的源码目录。")
+            return
+        d = QFileDialog.getExistingDirectory(self, "选择源码导出目录", os.path.expanduser("~"))
+        if not d:
+            return
+        try:
+            skip_dirs = {"build", "dist", "release", "__pycache__", ".git",
+                         ".pytest_cache", ".workbuddy", "venv", "envs"}
+            skip_ext = (".exe", ".pyc", ".pyo", ".log", ".lock")
+            count = 0
+            for root, dirs, files in os.walk(src_root):
+                dirs[:] = [x for x in dirs if x not in skip_dirs]
+                for fn in files:
+                    if fn.lower().endswith(skip_ext):
+                        continue
+                    if fn.startswith(("_probe_", "_diag_", "_staging", "_MEI")):
+                        continue
+                    if fn in ("session.json", "history.json", "app.lock"):
+                        continue
+                    sp = os.path.join(root, fn)
+                    rel = os.path.relpath(sp, src_root)
+                    dp = os.path.join(d, rel)
+                    os.makedirs(os.path.dirname(dp), exist_ok=True)
+                    shutil.copy2(sp, dp)
+                    count += 1
+            QMessageBox.information(self, "导出完成",
+                                    f"已将 {count} 个源文件导出到：\n{d}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
 
     def _quit(self):
         self._force_quit = True

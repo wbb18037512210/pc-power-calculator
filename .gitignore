@@ -34,3 +34,6 @@ PC用电汇总.png
 # 诊断脚本 / 数据备份
 _savedata/
 _probe_*.py
+_diag_*.py
+_src_bundle/
+_staging*.exe
