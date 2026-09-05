@@ -17,6 +17,8 @@ import os
 import json
 import time
 import threading
+import ctypes
+from ctypes import wintypes
 from datetime import datetime, timedelta
 from collections import deque
 
@@ -41,7 +43,7 @@ import hardware as H
 import power_model as PM
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.27"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.28"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 2000
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -64,6 +66,44 @@ HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 # 永远无法启动。故用心跳文件判定持有者是否真活着：心跳过期即视为已死，允许接管。
 LOCK_FILE = os.path.join(BASE_DIR, "app.lock")
 LOCK_FRESH_SEC = 45.0      # 心跳新鲜阈值（心跳每 20s 写一次）
+
+# v18.28 真实显示器电源状态：注册 GUID_MONITOR_POWER_ON 通知，捕获 WM_POWERBROADCAST
+# 事件。之前仅靠「空闲时长 ≥ 系统熄屏超时」推断显示器是否熄灭，手动按显示器电源键关屏
+# （不走过系统超时）永远识别不到；本事件能直接拿到显示器开关的真值。
+_MONITOR_POWER_ON_GUID = "{0273105A-6A1B-4244-AD7A-3A0B30C60E5D}"
+_WM_POWERBROADCAST = 0x0218
+_PBT_POWERSETTINGCHANGE = 0x8013
+_DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_uint32),
+                ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16),
+                ("Data4", ctypes.c_uint8 * 8)]
+
+
+class _POWERBROADCAST_SETTING(ctypes.Structure):
+    _fields_ = [("PowerSetting", _GUID),
+                ("DataLength", ctypes.c_uint32),
+                ("Data", ctypes.c_uint32)]
+
+
+def _parse_guid_str(s: str):
+    """'0273105A-6A1B-4244-AD7A-3A0B30C60E5D' -> (Data1, Data2, Data3, [8 字节])。"""
+    h = s.strip().strip("{}").replace("-", "")
+    d1 = int(h[0:8], 16)
+    d2 = int(h[8:12], 16)
+    d3 = int(h[12:16], 16)
+    b = [int(h[i:i + 2], 16) for i in range(16, 32, 2)]
+    return d1, d2, d3, b
+
+
+def _guid_to_str(g) -> str:
+    return "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}" % (
+        g.Data1, g.Data2, g.Data3,
+        g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+        g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7])
 
 
 def _beat():
@@ -644,6 +684,9 @@ class MainWindow(QMainWindow):
         self._disp_manual = None
         self.display_on = True
         self._disp_saved_wh = 0.0      # 熄屏期间累计省下的电量 Wh
+        # v18.28 真实显示器电源状态（来自 GUID_MONITOR_POWER_ON 事件）：True=显示器已物理关闭
+        self._monitor_phys_off = False
+        self._monitor_hook_handle = None
 
         self._build_ui()
         # v18 系统信息侧栏静态数据（一次性 WMI/注册表采集）
@@ -1278,6 +1321,10 @@ class MainWindow(QMainWindow):
                 return True
             self._disp_wake_notified = False
             return False
+        # v18.28 真实显示器电源事件优先：手动按显示器电源键关屏也能识别，
+        # 不再依赖「空闲时长 ≥ 系统熄屏超时」这一只能感知系统自动熄屏的启发式
+        if getattr(self, "_monitor_phys_off", False):
+            return False
         try:
             return not H.display_auto_off()
         except Exception:
@@ -1309,7 +1356,61 @@ class MainWindow(QMainWindow):
     def _disp_menu_set(self, state):
         """托盘菜单切换显示器状态：None=自动 / True=开 / False=关。"""
         self._set_display_manual(state)
-        self._sync_disp_menu()
+
+    # ---------------- v18.28 真实显示器电源事件 ----------------
+    def _install_monitor_power_hook(self):
+        """向主窗口注册 GUID_MONITOR_POWER_ON 通知，捕获显示器电源开关事件。
+
+        仅 Windows 有效；非 Windows 或注册失败则静默跳过（退回空闲推断）。
+        必须在窗口有原生句柄后调用（winId() 会强制创建）。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            u = ctypes.windll.user32
+            u.RegisterPowerSettingNotificationW.argtypes = (
+                ctypes.c_void_p, ctypes.POINTER(_GUID), ctypes.c_uint32)
+            u.RegisterPowerSettingNotificationW.restype = ctypes.c_void_p
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            g = _GUID()
+            d1, d2, d3, b = _parse_guid_str(_MONITOR_POWER_ON_GUID)
+            g.Data1, g.Data2, g.Data3 = d1, d2, d3
+            for i in range(8):
+                g.Data4[i] = b[i]
+            h = u.RegisterPowerSettingNotificationW(
+                ctypes.c_void_p(hwnd), ctypes.byref(g), _DEVICE_NOTIFY_WINDOW_HANDLE)
+            self._monitor_hook_handle = h or None
+        except Exception:
+            self._monitor_hook_handle = None
+
+    def nativeEvent(self, eventType, message):
+        """拦截 WM_POWERBROADCAST / PBT_POWERSETTINGCHANGE：显示器开关实时更新。"""
+        if sys.platform == "win32" and eventType == b"windows_generic_MSG":
+            try:
+                msg = ctypes.cast(int(message), ctypes.POINTER(wintypes.MSG)).contents
+                if msg.message == _WM_POWERBROADCAST and msg.wParam == _PBT_POWERSETTINGCHANGE:
+                    pbs = ctypes.cast(msg.lParam,
+                                     ctypes.POINTER(_POWERBROADCAST_SETTING)).contents
+                    if _guid_to_str(pbs.PowerSetting) == _MONITOR_POWER_ON_GUID:
+                        self._monitor_phys_off = (pbs.Data == 0)   # 0=关屏 1=开屏
+                        self.display_on = self._display_on()
+                        try:
+                            self._refresh_readout()
+                        except Exception:
+                            pass
+                        try:
+                            self._save_session()
+                        except Exception:
+                            pass
+                        try:
+                            self._sync_disp_menu()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
 
     def _sync_disp_menu(self):
         """同步托盘菜单三态勾选（is 比较以区分 False 与 None）。"""
@@ -3321,6 +3422,9 @@ def main():
             pass
     else:
         w.show()
+    # v18.28 真实显示器电源事件：窗口原生句柄(winId)就绪后注册 GUID_MONITOR_POWER_ON
+    # 通知。tray 模式 w.hide() 后仍可创建隐藏原生窗口句柄，钩子照常生效。
+    w._install_monitor_power_hook()
     # 首次刷新明细表
     w._refresh_breakdown()
     sys.exit(app.exec())

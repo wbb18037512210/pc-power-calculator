@@ -531,6 +531,17 @@ print("mini overlay v18.15 OK | 无底板 无双击隐藏 | 层级可切(置底/
 
 # ---- v18.18 悬浮窗：全面功耗构成（全部项，自动换行，高度自适应） ----
 _m = w.mini
+def _mini_bd_rows(_m):
+    """读取当前票据式构成表的所有行（名称, 瓦数文本）。v18.22 起每行是一个
+    QWidget(QHBoxLayout)，含两个 QLabel：名称 + '%.0f W'。"""
+    rows = []
+    for _row in _m._bd_row_widgets:
+        _lay = _row.layout()
+        _ln = _lay.itemAt(0).widget().text()
+        _lv = _lay.itemAt(1).widget().text()
+        rows.append((_ln, _lv))
+    return rows
+
 assert _m.bd_visible() is True, "默认应显示功耗构成"
 _m.set_bd_visible(False)
 _h0 = _m.height()          # 不显示构成时的基准高度
@@ -540,24 +551,26 @@ _h1 = _m.height()
 assert _h1 > _h0, (_h0, _h1)
 _m.set_breakdown({"CPU": 45.2, "GPU": 82.7, "显示器": 30.0,
                   "主板": 18.4, "内存": 6.1, "HDD": 8.5, "SSD": 3.2})
-_txt = _m.lbl_bd.text()
-for _frag in ("GPU 83", "CPU 45", "显示器 30", "主板 18", "内存 6", "HDD 8", "SSD 3"):
-    assert _frag in _txt, (_frag, _txt)
-assert "其他" not in _txt, "v18.18 起全部列出，不应再归并「其他」: %s" % _txt
-assert _txt.endswith(" W"), _txt
+_rows = _mini_bd_rows(_m)
+_names = [r[0] for r in _rows]
+for _frag in ("GPU", "CPU", "显示器", "主板", "内存", "HDD", "SSD"):
+    assert _frag in _names, (_frag, _names)
+assert "其他" not in _names, "v18.18 起全部列出，不应再归并「其他」: %s" % _names
+assert _names[-1] == "合计", _names
+assert all(r[1].endswith(" W") for r in _rows), _rows
 app.processEvents()
 assert _m.height() >= _h1, "全量构成后高度不应缩小: %s vs %s" % (_m.height(), _h1)
-assert _m.width() == 224, _m.width()
+assert _m.width() == 240, _m.width()  # v18.21 起悬浮窗宽 224→240
 # 关掉：控件隐藏 + 高度回到基准；再打开恢复显示
 _m.set_bd_visible(False)
-assert _m.bd_visible() is False and not _m.lbl_bd.isVisible()
+assert _m.bd_visible() is False and not _m.bd_widget.isVisible()
 _m.set_bd_visible(True)
 assert _m.bd_visible() is True
-# 空数据 / None 都不该崩，且清空文本
+# 空数据 / None 都不该崩，且清空行
 _m.set_breakdown({})
-assert _m.lbl_bd.text() == "", _m.lbl_bd.text()
+assert _mini_bd_rows(_m) == [], "空构成不应有行"
 _m.set_breakdown(None)
-assert _m.lbl_bd.text() == ""
+assert _mini_bd_rows(_m) == [], "None 不应有行"
 print("mini breakdown full OK | 高度 %d -> %d（全量 %d 项）" % (_h0, _m.height(), 7))
 
 # ---- v18.17 主界面宽度：此前被内容顶到 1983px，resize() 形同虚设 ----

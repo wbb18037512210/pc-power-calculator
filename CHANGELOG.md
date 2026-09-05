@@ -5,6 +5,38 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.28 — 真实显示器电源状态识别（修「显示器关闭后仍无法识别」）
+
+> 用户反馈：手动按显示器电源键关屏后，程序仍记成「显示器开启」、照常计 30W。
+> 根因：`display_auto_off()`（hardware.py:646）只靠「空闲时长 ≥ 系统熄屏超时」启发式推断，
+> 只能识别**系统自动熄屏**；手动按显示器电源键关屏时系统层面无感知，永远推断不到。
+
+### 修复方案
+- **接入 Windows 真实电源事件**：向主窗口注册 `GUID_MONITOR_POWER_ON`
+  （`{0273105A-6A1B-4244-AD7A-3A0B30C60E5D}`）通知，拦截
+  `WM_POWERBROADCAST`(0x0218) / `PBT_POWERSETTINGCHANGE`(0x8013) 事件，
+  从 `POWERBROADCAST_SETTING.Data` 直接读出显示器开关真值（0=关屏 / 1=开屏）。
+- 新增模块级 ctypes 结构 `_GUID` / `_POWERBROADCAST_SETTING` 与辅助
+  `_parse_guid_str` / `_guid_to_str`（字符串 ↔ `_GUID` 互转，大小写/花括号容错）。
+- 主窗口新增 `_install_monitor_power_hook()`（窗口原生句柄就绪后调用，
+  `winId()` 强制创建；注册失败 / 非 Windows 静默退回空闲推断）与
+  `nativeEvent()` 事件分发：命中显示器电源事件即更新
+  `self._monitor_phys_off` 并实时重算 `display_on`、刷新读数、落盘、同步托盘菜单勾选。
+- `_display_on()` 自动检测分支前插入**最高优先级短路**：`_monitor_phys_off` 为真直接返回 False，
+  不再走空闲推断 —— 手动关屏也能即时扣掉显示器 30W。
+- `main()` 在 `w.show()`（tray 模式 `w.hide()` 同理，隐藏窗口仍会创建原生句柄）之后统一调用
+  `_install_monitor_power_hook()`，确保钩子只在句柄就绪后挂载。
+- 手动「记为关闭 / 开启」三态标记仍优先于本自动检测（与既有行为一致）。
+
+### 交付验证
+- `main.py` 通过 `py_compile`（已修正一处误置在 `return` 之后的死代码
+  `self._sync_disp_menu()`，移入事件处理块内正常执行）。
+- 后续计划（未本次完成）：补一个不拉起完整 UI、仅验证
+  `RegisterPowerSettingNotificationW` 注册 + nativeEvent 解析的单元/集成测试；
+  以及把「显示器开关」状态也写入 `session.json` 持久化（重启后保留最后一次真实电源读数）。
+
+---
+
 ## v18.27 — 代码审查评估后的质量整改（按 v18.26 评估报告）
 
 > 依据 `代码审查评估报告_v18.26.md` 的 P0/P1 项整改；高风险的「上帝类大重构 / 40 字段
