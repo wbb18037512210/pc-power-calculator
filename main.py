@@ -41,7 +41,7 @@ import hardware as H
 import power_model as PM
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.26"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.27"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 2000
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -1662,12 +1662,22 @@ class MainWindow(QMainWindow):
 
     def _refresh_breakdown(self):
         bd = self.cur.get("breakdown", {})
+        keys = list(bd.keys())
+        # v18.27 差异更新：部件集合不变时只刷新数值单元格，避免每 2s 全表重建
+        if getattr(self, "_bd_keys", None) == keys and getattr(self, "_bd_val_items", None):
+            for name, item in zip(keys, self._bd_val_items):
+                item.setText(f"{bd[name]:.1f}")
+            return
         self.table.setRowCount(0)
-        for name, w in bd.items():
+        self._bd_val_items = []
+        for name in keys:
             r = self.table.rowCount()
             self.table.insertRow(r)
             self.table.setItem(r, 0, QTableWidgetItem(str(name)))
-            self.table.setItem(r, 1, QTableWidgetItem(f"{w:.1f}"))
+            vi = QTableWidgetItem(f"{bd[name]:.1f}")
+            self.table.setItem(r, 1, vi)
+            self._bd_val_items.append(vi)
+        self._bd_keys = keys
 
     # ---------------- 控制 ----------------
     def toggle_run(self):
@@ -2016,66 +2026,65 @@ class MainWindow(QMainWindow):
         al, alth, bk, bc, bap, bal = s["al"], s["alth"], s["bk"], s["bc"], s["bap"], s["bal"]
         ict, igt, inud, inm = s["ict"], s["igt"], s["inud"], s["inm"]
         au, aum, ck, cidle, cpeak = s["au"], s["aum"], s["ck"], s["cidle"], s["cpeak"]
-        if True:   # 对齐原对话框「确认」分支的缩进层级（赋值体原样保留）
-            self.rate = rate.value()
-            self.window_hours = win.value()
-            self.psu_eff = eff.value()
-            self.model.psu_efficiency = eff.value()
-            # v18.11 电源额定功率：>0 启用动态效率曲线，0 沿用上面固定效率
-            self.psu_rating_w = float(s["pr"].value() or 0)
-            self.model.psu_rating_w = self.psu_rating_w
-            self.sample_ms = samp.value()
-            self.worker.set_interval(samp.value())
-            self.calib_k = ck.value()
-            self.calib_idle = cidle.value()
-            self.calib_peak = cpeak.value()
-            self.model.calib_k = self.calib_k
-            self.model.calib_idle = self.calib_idle
-            self.model.calib_peak = self.calib_peak
-            self.price_mode = mode.currentText()
-            self.rate_valley = rv.value()
-            self.rate_flat = rf.value()
-            self.rate_peak = rp.value()
-            self.tier_base = tbase.value()
-            self.tier_l1 = tl1.value()
-            self.tier_r1 = tr1.value()
-            self.tier_l2 = tl2.value()
-            self.tier_r2 = tr2.value()
-            self.tier_r3 = tr3.value()
-            self.tou_valley = (vsb.value(), veb.value())
-            peaks = []
-            if p1s.value() < p1e.value():
-                peaks.append((p1s.value(), p1e.value()))
-            if p2s.value() < p2e.value():
-                peaks.append((p2s.value(), p2e.value()))
-            self.tou_peak = peaks
-            self.autostart = au.isChecked()
-            self.autostart_monitor = aum.isChecked()
-            self._set_autostart(self.autostart)
-            self.alert_enabled = al.isChecked()
-            self.alert_threshold = alth.value()
-            self._alert_active = False
-            self.budget_kwh = bk.value()
-            self.budget_cost = bc.value()
-            self.budget_alert_pct = bap.value()
-            self.budget_alert_enabled = bal.isChecked()
-            self._budget_alert_active = False
-            self.idle_cpu_thresh = ict.value()
-            self.idle_gpu_thresh = igt.value()
-            self.idle_nudge_enabled = inud.isChecked()
-            self.idle_nudge_min = inm.value()
-            self._toggle_mini(s["mini"].isChecked())   # v18.10 迷你悬浮窗开关（内部会存会话）
-            # v18.11 显示器状态：currentData 可能返回非 bool，做一次收敛
-            _dm = s["disp"].currentData()
-            self._disp_manual = _dm if isinstance(_dm, bool) else None
-            self.display_on = self._display_on()
-            self._sync_disp_menu()
-            self.rate_sub.setText(f"电价 {self.rate:.2f} 元/度 ▸ 点击改价"
-                                  + (f" · 计费方式：{self.price_mode}" if self.price_mode != "单一" else ""))
-            self._refresh_readout()
-            self._save_session()
-            self._settings_dock.hide()          # 保存后自动收起面板
-            self.status_lbl.setText("设置已保存 · 立即生效")
+        self.rate = rate.value()
+        self.window_hours = win.value()
+        self.psu_eff = eff.value()
+        self.model.psu_efficiency = eff.value()
+        # v18.11 电源额定功率：>0 启用动态效率曲线，0 沿用上面固定效率
+        self.psu_rating_w = float(s["pr"].value() or 0)
+        self.model.psu_rating_w = self.psu_rating_w
+        self.sample_ms = samp.value()
+        self.worker.set_interval(samp.value())
+        self.calib_k = ck.value()
+        self.calib_idle = cidle.value()
+        self.calib_peak = cpeak.value()
+        self.model.calib_k = self.calib_k
+        self.model.calib_idle = self.calib_idle
+        self.model.calib_peak = self.calib_peak
+        self.price_mode = mode.currentText()
+        self.rate_valley = rv.value()
+        self.rate_flat = rf.value()
+        self.rate_peak = rp.value()
+        self.tier_base = tbase.value()
+        self.tier_l1 = tl1.value()
+        self.tier_r1 = tr1.value()
+        self.tier_l2 = tl2.value()
+        self.tier_r2 = tr2.value()
+        self.tier_r3 = tr3.value()
+        self.tou_valley = (vsb.value(), veb.value())
+        peaks = []
+        if p1s.value() < p1e.value():
+            peaks.append((p1s.value(), p1e.value()))
+        if p2s.value() < p2e.value():
+            peaks.append((p2s.value(), p2e.value()))
+        self.tou_peak = peaks
+        self.autostart = au.isChecked()
+        self.autostart_monitor = aum.isChecked()
+        self._set_autostart(self.autostart)
+        self.alert_enabled = al.isChecked()
+        self.alert_threshold = alth.value()
+        self._alert_active = False
+        self.budget_kwh = bk.value()
+        self.budget_cost = bc.value()
+        self.budget_alert_pct = bap.value()
+        self.budget_alert_enabled = bal.isChecked()
+        self._budget_alert_active = False
+        self.idle_cpu_thresh = ict.value()
+        self.idle_gpu_thresh = igt.value()
+        self.idle_nudge_enabled = inud.isChecked()
+        self.idle_nudge_min = inm.value()
+        self._toggle_mini(s["mini"].isChecked())   # v18.10 迷你悬浮窗开关（内部会存会话）
+        # v18.11 显示器状态：currentData 可能返回非 bool，做一次收敛
+        _dm = s["disp"].currentData()
+        self._disp_manual = _dm if isinstance(_dm, bool) else None
+        self.display_on = self._display_on()
+        self._sync_disp_menu()
+        self.rate_sub.setText(f"电价 {self.rate:.2f} 元/度 ▸ 点击改价"
+                              + (f" · 计费方式：{self.price_mode}" if self.price_mode != "单一" else ""))
+        self._refresh_readout()
+        self._save_session()
+        self._settings_dock.hide()          # 保存后自动收起面板
+        self.status_lbl.setText("设置已保存 · 立即生效")
 
     # ---------------- 每日日报（v18.9：跨零点自动汇总前一日） ----------------
     def _check_daily_rollover(self):
@@ -2566,8 +2575,12 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
             }
             with open(SESSION_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f)
-        except Exception:
-            pass
+        except Exception as e:
+            # v18.27 不再静默吞异常：会话写盘失败应留痕，便于排查配置丢失
+            try:
+                print(f"[session] 保存失败: {e!r}")
+            except Exception:
+                pass
 
     def _load_session_maybe(self):
         if not os.path.exists(SESSION_FILE):

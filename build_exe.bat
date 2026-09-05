@@ -7,7 +7,8 @@ rem  要求: 本文件必须是 GBK + CRLF 编码保存
 rem ============================================================
 setlocal EnableDelayedExpansion
 chcp 936 >nul
-cd /d "C:\Users\Administrator\WorkBuddy\2026-09-03-17-33-15\pc_power_calc"
+rem 用脚本自身所在目录作为工作目录，去掉硬编码绝对路径，使任意克隆目录都可跑
+cd /d "%~dp0"
 set "PY=C:\Users\Administrator\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
 set "NAME=PC用电电费计算器"
 

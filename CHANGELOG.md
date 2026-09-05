@@ -5,6 +5,40 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.27 — 代码审查评估后的质量整改（按 v18.26 评估报告）
+
+> 依据 `代码审查评估报告_v18.26.md` 的 P0/P1 项整改；高风险的「上帝类大重构 / 40 字段
+> Settings dataclass」按报告自身的「绞杀者模式」建议**留作后续增量**，本次只落实安全收益项。
+
+### P0 — 正确性 / 可测性
+- **W3 硬件识别准确性 bug 修复**：`_find_key` 由「子串包含、先命中短前缀」改为
+  **最长匹配优先 + 词边界正则 + 归一化**。修复 `RTX 3060 Ti`(200) 被错认成 `RTX 3060`(170)、
+  `GTX 1660 Super`(125) 被错认成 `GTX 1660`(120) 等；`RX 6800 XT` 不再被 `RX 6800` 截短。
+  - **回归发现**：报告自带补丁的 `_norm` 无差别剥离 `graphics`，会把键 `Radeon Graphics`
+    变成 `radeon`，导致它误匹配所有 Radeon 独显（如 `RX 5800 XT` 错认成 25W 核显）。
+    已修正为「仅在 Intel 家族词后剥离 graphics」，并补 `test_find_key_radeon_graphics_only_matches_integrated` 防回归。
+- **W1 测试套件对齐 v18.26**：`test_headless.py` 不再断言已删除的 `_render_pdf`/`%PDF-`，
+  改为断言 `_render_png` 落盘 PNG（校验存在性 / 字节数 / PNG 签名）。修前该测试在第 832 行必 `AttributeError` 失败。
+
+### P1 — 可维护性 / 性能
+- **W2 绞杀者第一步**：新增零 Qt 依赖的 `power_core.PowerEngine`（瞬时估算 / 单一·峰谷·阶梯计费 /
+  峰谷分段累计 / idle 识别 / 节能模拟），并配套 `tests/test_core.py`（纯逻辑、不拉起 Qt）。
+  MainWindow 计费逻辑暂未重写委托（避免大改引入回归），下一步再逐步迁移。
+- **W7 删除死代码**：移除 `_save_settings_panel` 内 `if True:` 空壳分支，赋值体缩进一并收平。
+- **W6 构建脚本可移植**：`build_exe.bat` 去掉硬编码绝对路径，改用 `cd /d "%~dp0"`。
+- **W5 异常不再静默吞**：`_save_session` 写盘失败改为 `print("[session] 保存失败: …")` 留痕。
+- **2.3 构成表差异刷新**：`_refresh_breakdown` 在部件集合不变时只更新数值单元格，
+  不再每 2s 全表 `setRowCount(0)` 重建。
+
+### P2 — 工程化
+- 新增 `README.md`：模块职责图 + 打包流程 + 如何跑测试。
+
+### 交付验证
+- `tests/test_core.py` 12 个纯逻辑用例全部通过（含 `_find_key` 准确性 + `PowerEngine` 计量）。
+- `main.py`/`power_model.py`/`power_core.py`/`test_headless.py` 均 `py_compile` 通过。
+
+---
+
 ## v18.26 — 报告导出从 PDF 改为 PNG 图片
 
 ### 导出格式切换为 PNG

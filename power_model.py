@@ -134,11 +134,38 @@ class PowerModel:
         return host_w * self.calib_k
 
 
+def _norm_key(s: str) -> str:
+    """归一化型号字符串，便于稳定匹配。
+    * 去 (R)/(TM)/®/™ 商标符；
+    * 仅「Intel 系」（UHD/HD/Iris）后方才剥离 'graphics' 填充词，
+      使 'Intel UHD Graphics 630' -> 'intel uhd 630' 能命中 'UHD 630'。
+      —— 注意不能无差别剥离：键 'Radeon Graphics' 经 \bgraphics\b 会变成
+      'radeon'，导致它误匹配所有 Radeon 独显（如 RX 5800 XT 被错认成 25W
+      核显）。故只在 Intel 家族词后剥离。
+    * 折叠空白。
+    """
+    s = (s or "").lower()
+    s = re.sub(r"\(r\)|\(tm\)|®|™", "", s)
+    s = re.sub(r"\b(?:intel\s+)?(?:u|uhd|hd|iris|iris\s+xe)\s+graphics\b",
+               lambda m: m.group(0).replace(" graphics", ""), s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def _find_key(name: str, table: dict) -> Optional[int]:
+    """最长匹配优先：型号字符串可能同时包含 'RTX 3060' 与 'RTX 3060 Ti'，
+    必须取最长（最具体）的 key，否则会先命中短前缀，把 Ti/SUPER 错认成低规格型号
+    （RTX 3060 Ti -> 200 误为 170；GTX 1660 Super -> 125 误为 120）。
+
+    词边界正则 (?<!\\w)...(?!\\w) 防止 'RX 580' 误中 'RX 5800' 之类。
+    """
+    n = _norm_key(name)
+    best_v, best_len = None, -1
     for k, v in table.items():
-        if k.lower() in name.lower():
-            return v
-    return None
+        kl = _norm_key(k)
+        if re.search(r"(?<![\w])" + re.escape(kl) + r"(?![\w])", n):
+            if len(kl) > best_len:
+                best_v, best_len = v, len(kl)
+    return best_v
 
 
 def build_model(hw, psu_efficiency: float = PSU_EFFICIENCY) -> PowerModel:

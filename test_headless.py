@@ -821,25 +821,25 @@ assert _minw <= _avail, (
 w._settings_dock.hide()
 print("settings dock no-clip OK | 内容最小 %d px <= 可视区 %d px" % (_minw, _avail))
 
-# ---- v18.15 报告直接导出 PDF + 迷你悬浮窗快照 ----
+# ---- v18.26 报告导出 PNG + 迷你悬浮窗快照 ----
 _html = w._build_report_html()
 assert "迷你悬浮窗" in _html, "报告里应包含迷你悬浮窗快照"
 assert "瞬时插座功耗" in _html, "快照应含瞬时功耗行"
 assert "本轮累计" in _html, "快照应含本轮累计行"
-_pdf = os.path.join(_TMPDIR, "report_test.pdf")
-if os.path.exists(_pdf):
-    os.remove(_pdf)
-assert w._render_pdf(_html, _pdf) is True, "PDF 渲染应返回 True"
-assert os.path.exists(_pdf), "PDF 文件应生成"
-_size = os.path.getsize(_pdf)
-assert _size > 1024, "PDF 不应只有 %d 字节" % _size
-with open(_pdf, "rb") as _f:
-    assert _f.read(5) == b"%PDF-", "文件头应是 %PDF-"
-print("report PDF OK | %d bytes, 含迷你悬浮窗快照" % _size)
-# 导出入口应指向 PDF
-assert callable(w.export_report) and callable(w._save_pdf)
-assert hasattr(w, "_render_pdf")
-print("export_report -> PDF OK")
+_png = os.path.join(_TMPDIR, "report_test.png")
+if os.path.exists(_png):
+    os.remove(_png)
+assert w._render_png(_html, _png) is True, "PNG 渲染应返回 True"
+assert os.path.exists(_png), "PNG 文件应生成"
+_size = os.path.getsize(_png)
+assert _size > 1024, "PNG 不应只有 %d 字节" % _size
+with open(_png, "rb") as _f:
+    assert _f.read(8) == b"\x89PNG\r\n\x1a\n", "文件头应是 PNG 签名"
+print("report PNG OK | %d bytes, 含迷你悬浮窗快照" % _size)
+# 导出入口应指向 PNG
+assert callable(w.export_report) and callable(w._save_png)
+assert hasattr(w, "_render_png")
+print("export_report -> PNG OK")
 
 w.close()
 print("HEADLESS_OK")
