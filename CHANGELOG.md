@@ -11,7 +11,9 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 - 用户需求：把「PC用电汇总」导出从 PDF 改成 PNG 图片，便于直接贴图/分享。
 - 把原有 `QTextDocument + QPrinter(PdfFormat)` 渲染链路替换为 `QTextDocument + QImage`：
   - 同一套 HTML 解析引擎，版式与旧 PDF 完全一致；
-  - 渲染宽度 860px、2× 超采样（1720px 逻辑宽），得到清晰的视网膜级图片；
+  - 渲染宽度从 860 提到 **960px**、2× 超采样（1920px 逻辑宽），图片更宽但不会纵向过长；
+  - 收紧报告 CSS 间距（body/card/box padding、margin、字号、表格行高）并压扁 24 小时条形图，
+    在保持可读性的前提下让整图高度明显下降（实测同一内容逻辑高度 1500px → 1203px，约 -20%）；
   - 移除 `QtPrintSupport`/`QPrinter`/`QPageLayout`/`QPageSize` 依赖，进一步降低打包负担。
 - 导出按钮与汇总弹窗主按钮文案统一改为「保存报告(PNG)」，默认文件名 `PC用电汇总.png`。
 - HTML 导出继续保留作为「可二次排版」的备用格式。

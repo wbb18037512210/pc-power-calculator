@@ -2347,19 +2347,19 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
                 s, n = self.hourly[k]
                 avg = s / n if n else 0
                 pct = (avg / maxv * 100) if maxv else 0
-                bars += (f"<div style='margin:4px 0;'><div style='font-size:12px;color:#555;'>{k} "
-                         f"· {avg:.0f}W</div><div style='background:#eef1f7;border-radius:4px;'>"
-                         f"<div style='width:{pct:.0f}%;background:#2f6bff;height:14px;border-radius:4px;'></div></div></div>")
+        bars += (f"<div style='margin:2px 0;'><div style='font-size:10px;color:#555;'>{k} "
+                 f"· {avg:.0f}W</div><div style='background:#eef1f7;border-radius:2px;'>"
+                 f"<div style='width:{pct:.0f}%;background:#2f6bff;height:8px;border-radius:2px;'></div></div></div>")
         bd = self.cur.get("breakdown", {})
         bd_rows = "".join(f"<tr><td>{k}</td><td style='text-align:right'>{v:.1f} W</td></tr>" for k, v in bd.items())
         return f"""
 <html><head><meta charset="utf-8"><style>
-body{{font-family:'Microsoft YaHei',sans-serif;background:#f4f6f9;color:#1f2a44;margin:0;padding:24px;}}
-.h{{font-size:22px;font-weight:700;}} .card{{background:#fff;border-radius:12px;padding:18px;margin:14px 0;
-border:1px solid #e6e9ef;}} .k{{color:#8a93a6;font-size:12px;}} .v{{font-size:30px;font-weight:700;}}
-.grid{{display:flex;gap:14px;flex-wrap:wrap;}} .box{{flex:1;min-width:150px;background:#fff;border-radius:12px;
-padding:16px;border:1px solid #e6e9ef;}} table{{width:100%;border-collapse:collapse;font-size:13px;}}
-td{{padding:6px 4px;border-bottom:1px solid #eef1f7;}}
+body{{font-family:'Microsoft YaHei',sans-serif;background:#f4f6f9;color:#1f2a44;margin:0;padding:12px;}}
+.h{{font-size:18px;font-weight:700;}} .card{{background:#fff;border-radius:9px;padding:11px;margin:8px 0;
+border:1px solid #e6e9ef;}} .k{{color:#8a93a6;font-size:11px;}} .v{{font-size:24px;font-weight:700;}}
+.grid{{display:flex;gap:8px;flex-wrap:wrap;}} .box{{flex:1;min-width:120px;background:#fff;border-radius:9px;
+padding:10px;border:1px solid #e6e9ef;}} table{{width:100%;border-collapse:collapse;font-size:12px;}}
+td{{padding:3px 4px;border-bottom:1px solid #eef1f7;}}
 </style></head><body>
 <div class="h">PC 用电电费 · 24 小时汇总</div>
 <div class="k">生成时间：{now}</div>
@@ -2388,12 +2388,14 @@ td{{padding:6px 4px;border-bottom:1px solid #eef1f7;}}
 CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_note}</div>
 </body></html>"""
 
-    def _render_png(self, html: str, path: str, width: int = 860, scale: float = 2.0) -> bool:
+    def _render_png(self, html: str, path: str, width: int = 960, scale: float = 2.0) -> bool:
         """把报告 HTML 渲染成 PNG 图片；成功返回 True，不弹任何对话框。
 
         沿用 QTextDocument 引擎（与旧版 _render_pdf 同一套 HTML 解析），只是输出
         目标从 QPrinter(PdfFormat) 换成 QImage——因此版式与旧 PDF 完全一致，但得到
         一张可直接贴图 / 分享的图片。纯 Qt，完全离线，也不会让 exe 膨胀。
+
+        width 从 860 提到 960、CSS 间距收紧，用于解决报告 PNG 高度过长的问题。
 
         width 为报告逻辑宽度（px），scale 为超采样倍数（2 => 视网膜级清晰度）。
         """
