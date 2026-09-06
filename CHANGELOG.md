@@ -5,6 +5,35 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.36 — 真实温度/风扇数据源(LHM Web Server) + 悬浮窗构成四列 + 迷你进度条
+
+### 数据源：接入 LibreHardwareMonitor Web Server
+- **穷举实测确认**：本机（管理员权限）`Win32_Fan`、`Win32_TemperatureProbe`、
+  `MSAcpi_ThermalZoneTemperature`、`ThermalZoneInformation` 计数器、
+  厂商命名空间（ASUS/Gigabyte/MSI/ASRock/HP/Dell）全部为空 —— Windows 免驱
+  没有 CPU/内存/主板温度与风扇转速接口，此前这些只能显示 —。
+- 安装 LibreHardwareMonitor v0.9.6（`D:\tools\LibreHardwareMonitor`）+ PawnIO 驱动；
+  新版 LHM 已移除 WMI Provider，采集改走其 Web Server（`127.0.0.1:8085/data.json`），
+  代理被绕过（ProxyHandler({})）；OpenHardwareMonitor WMI 保留为回退。
+- 本机实测取到：CPU Tctl/Tdie（AMD 5600X）、主板 SuperIO NCT6793D 温度、
+  机箱风扇 + GPU 风扇转速；SuperIO 坏通道（110/106/103°）用 5–100°C 过滤。
+- 构成表温度列接入：CPU/内存/主板取 LHM 温度；风扇行温度列改显最高转速 RPM。
+- 硬件信息块：处理器温度兜底 LHM；主板行新增实时温度。
+- LHM 已设注册表 Run 开机自启（未装 LHM 时应用一切照旧，显示 — 不报错）。
+
+### 悬浮窗功耗构成四列化
+- 构成行从「部件+功耗」扩为「部件 | 使用率 | 功耗 W | 温度/转速」（320px 宽），
+  数据随主界面同源刷新；合计行保持金色两列。
+
+### 使用率进度条改迷你样式
+- 之前 16px 实心条填满单元格，视觉过硬；改为 22px 单元格内 10px 细条垂直居中
+  （「填充一半、留下一半」），百分比移到条右侧小标签。
+
+### 其他
+- 硬件信息里处理器/物理内存的 ASCII 使用率条移除（与构成表进度条职责重复）。
+
+---
+
 ## v18.35 — 实时卡片布局修复 + 构成表四列 + 控制条平铺 + 风扇转速
 
 ### 布局根因修复：读数网格塌缩（用户截图"空白"的真凶）

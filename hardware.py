@@ -99,26 +99,46 @@ def _ps(script: str, timeout: int = 15) -> Optional[str]:
         return None
 
 
-# ---------------- v18.35 风扇转速 ----------------
-# Windows 没有标准 WMI 风扇接口（Win32_Fan 基本全空），唯一免驱来源是
-# LibreHardwareMonitor / OpenHardwareMonitor 暴露的 WMI 命名空间——装了才有数据，
-# 没装就显示 —（降级，不报错）。PowerShell spawn 有数百 ms 开销，故 10s 缓存节流；
-# 两个命名空间都不存在时 120s 才重试一次，避免无意义开销。
-_FAN_TTL_OK = 10.0
-_FAN_TTL_FAIL = 120.0
-_FAN_NAMESPACES = ("root/LibreHardwareMonitor", "root/OpenHardwareMonitor")
-_fan_state = {"last_ts": 0.0, "ttl": 0.0, "rpms": []}
+# ---------------- v18.36 传感器快照（温度 + 风扇转速）----------------
+# Windows 免驱拿不到 CPU / 内存 / 主板温度和风扇转速。实测（管理员权限）：
+#   Win32_Fan                                             → 空
+#   Win32_TemperatureProbe                                → 空
+#   MSAcpi_ThermalZoneTemperature (root/WMI)              → 空
+#   Win32_PerfFormattedData_Counters_ThermalZoneInformation → 空
+#   厂商命名空间 (ASUS/Gigabyte/MSI/ASRock/HP/Dell)        → 无 Sensor 类
+# 这些都要主板在 ACPI/SMBIOS 里上报热区，台式机普遍没有。唯一免驱来源是
+# LibreHardwareMonitor / OpenHardwareMonitor 暴露的 WMI 命名空间——它自带
+# 内核驱动直接读 Super I/O / EC 芯片，装了才有数据，没装显示 —（降级不报错）。
+# PowerShell spawn 有数百 ms 开销，故 10s 缓存节流；命名空间不存在时 120s 才重试。
+_SENSOR_TTL_OK = 10.0
+_SENSOR_TTL_FAIL = 120.0
+_SENSOR_NS = ("root/LibreHardwareMonitor", "root/OpenHardwareMonitor")
+_sensor_state = {"last_ts": 0.0, "ttl": 0.0, "fans": [], "temps": {}, "ready": False}
+
+# LHM 传感器名 → 语义键。同一键内关键词按优先级排序：
+# 例如 CPU Package 优先于 CPU Core #1（后者是单核温度，不代表整体）。
+_TEMP_RULES = (
+    ("cpu",         ("cpu package", "cpu total", "cpu cores", "cpu core", "cpu")),
+    ("memory",      ("memory", "dimm", "dram", "ram")),
+    ("motherboard", ("motherboard", "mainboard", "system", "chipset",
+                     "pch", "vrm", "tempin", "aux")),
+)
 
 
-def _parse_fans_json(out: str) -> list:
-    """解析 ConvertTo-Json 输出为 [(name, rpm), ...]；容错单对象/数组/空。"""
+def _parse_sensors(out: str):
+    """解析 Sensor 的 ConvertTo-Json 输出为 (fans, temps)。
+
+    fans  = [(name, rpm), ...]
+    temps = {"cpu"|"memory"|"motherboard": 摄氏度}
+    """
     try:
         data = json.loads(out)
     except Exception:
-        return []
+        return [], {}
     if isinstance(data, dict):
         data = [data]
     fans = []
+    cands = {"cpu": [], "memory": [], "motherboard": []}
     for d in data or []:
         if not isinstance(d, dict):
             continue
@@ -126,32 +146,141 @@ def _parse_fans_json(out: str) -> list:
             v = float(d.get("Value"))
         except (TypeError, ValueError):
             continue
-        if v > 0:
-            fans.append((str(d.get("Name") or "Fan"), round(v)))
-    return fans
+        st = str(d.get("SensorType") or "")
+        name = str(d.get("Name") or "")
+        if st == "Fan":
+            if v > 0:
+                fans.append((name or "Fan", int(round(v))))
+            continue
+        if st != "Temperature" or v <= 0:
+            continue
+        low = name.lower()
+        for key, kws in _TEMP_RULES:
+            for prio, kw in enumerate(kws):
+                if kw in low:
+                    cands[key].append((prio, v))
+                    break
+            else:
+                continue
+            break
+    temps = {}
+    for key, lst in cands.items():
+        if lst:
+            lst.sort(key=lambda x: x[0])      # 优先级最小者胜
+            temps[key] = round(lst[0][1], 1)
+    return fans, temps
 
 
-def _query_fan_rpms() -> list:
-    for ns in _FAN_NAMESPACES:
+def _parse_lhm_json(text: str):
+    """解析 LibreHardwareMonitor Web Server 的 /data.json 树。
+
+    节点结构：{Text, Min, Value, Max, Type, HardwareId, Children}；
+    Value 是带单位的字符串（如 "79.6 °C"、"1937 RPM"），取首段转 float。
+    温度分类靠节点 HardwareId 前缀：
+      /amdcpu /intelcpu → cpu；/lpc /motherboard → 主板；/ram → 内存。
+    SuperIO 坏通道（实测 110/106/103° 的 AUX 电压等效读数）用 5–100°C 过滤。
+    返回 (fans, temps, ready)。
+    """
+    try:
+        data = json.loads(text)
+    except Exception:
+        return [], {}, False
+    fans = []
+    cands = {"cpu": [], "memory": [], "motherboard": []}
+
+    def _val(node):
+        try:
+            return float(str(node.get("Value") or "").split()[0])
+        except (ValueError, IndexError):
+            return None
+
+    def walk(node, kind):
+        hwid = str(node.get("HardwareId") or "")
+        if hwid.startswith(("/amdcpu", "/intelcpu")):
+            kind = "cpu"
+        elif hwid.startswith(("/lpc", "/motherboard")):
+            kind = "board"
+        elif hwid.startswith("/ram"):
+            kind = "ram"
+        tp = node.get("Type") or ""
+        if tp in ("Temperature", "Fan"):
+            v = _val(node)
+            if v is not None:
+                name = str(node.get("Text") or "")
+                if tp == "Fan":
+                    if v > 0:
+                        fans.append((name or "Fan", int(round(v))))
+                elif 5.0 <= v <= 100.0:          # 过滤坏通道
+                    low = name.lower()
+                    if kind == "cpu":
+                        # 优先级：Tctl/Tdie 整体温度 > Core > CCD 单核
+                        # （"CCD1 (Tdie)" 也含 tdie，不能据此给最高优先级）
+                        if "tctl" in low:
+                            prio = 0
+                        elif "core" in low:
+                            prio = 1
+                        elif "ccd" in low:
+                            prio = 2
+                        else:
+                            prio = 3
+                        cands["cpu"].append((prio, v))
+                    elif kind == "board":
+                        cands["motherboard"].append((0, v))
+                    elif kind == "ram":
+                        cands["memory"].append((0, v))
+        for c in node.get("Children") or []:
+            walk(c, kind)
+
+    walk(data, "")
+    temps = {}
+    for key, lst in cands.items():
+        if lst:
+            lst.sort(key=lambda x: x[0])
+            temps[key] = round(lst[0][1], 1)
+    return fans, temps, True
+
+
+def _query_sensors():
+    """优先 LibreHardwareMonitor Web Server（v0.9+ 已移除 WMI Provider），
+    回退 OpenHardwareMonitor WMI（老版有 WMI）。返回 (fans, temps, ready)。"""
+    try:
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        raw = opener.open("http://127.0.0.1:8085/data.json", timeout=5).read()
+        fans, temps, ready = _parse_lhm_json(raw.decode("utf-8-sig", "ignore"))
+        if ready:
+            return fans, temps, True
+    except Exception:
+        pass
+    for ns in _SENSOR_NS:
         out = _ps(f"(Get-CimInstance -Namespace {ns} -ClassName Sensor "
-                  f"-Filter \"SensorType='Fan'\" -ErrorAction SilentlyContinue | "
-                  f"Select-Object Name,Value | ConvertTo-Json -Compress)", timeout=6)
-        fans = _parse_fans_json(out or "")
-        if fans:
-            return fans
-    return []
+                  f"-ErrorAction SilentlyContinue | "
+                  f"Select-Object Name,SensorType,Value,Identifier | "
+                  f"ConvertTo-Json -Compress)", timeout=8)
+        if not out:
+            continue
+        fans, temps = _parse_sensors(out)
+        if fans or temps:
+            return fans, temps, True
+    return [], {}, False
+
+
+def sensor_snapshot_cached(force: bool = False):
+    """(fans, temps, ready)：10s 缓存；force 用于「重新检测硬件」立即刷新。"""
+    now = time.time()
+    st = _sensor_state
+    if not force and now - st["last_ts"] < st["ttl"]:
+        return st["fans"], st["temps"], st["ready"]
+    fans, temps, ready = _query_sensors()
+    st.update(fans=fans, temps=temps, ready=ready, last_ts=now,
+              ttl=_SENSOR_TTL_OK if ready else _SENSOR_TTL_FAIL)
+    return fans, temps, ready
 
 
 def fan_rpms_cached() -> list:
-    now = time.time()
-    st = _fan_state
-    if now - st["last_ts"] < st["ttl"]:
-        return st["rpms"]
-    rpms = _query_fan_rpms()
-    st["rpms"] = rpms
-    st["last_ts"] = now
-    st["ttl"] = _FAN_TTL_OK if rpms else _FAN_TTL_FAIL
-    return rpms
+    """向后兼容：v18.35 起的接口，只取风扇部分。"""
+    fans, _t, _r = sensor_snapshot_cached()
+    return fans
 
 
 def _is_virtual_gpu(name: str) -> bool:
@@ -586,11 +715,16 @@ def sample_dynamic(prev_net):
                 info["up_kbs"] = max(0.0, (cur[1] - prev_net[1]) / dt / 1024.0)
         except Exception:
             pass
-    # v18.35 风扇转速（内部 10s 缓存节流；worker 线程执行，不卡 UI）
+    # v18.36 传感器快照（风扇 + CPU/内存/主板温度；内部 10s 缓存节流，
+    # worker 线程执行，不卡 UI）。数据源为 LibreHardwareMonitor/OpenHardwareMonitor，
+    # 没装则 fans/temps 为空、sensor_ready=False（UI 据此提示）。
     try:
-        fans = fan_rpms_cached()
+        fans, temps, ready = sensor_snapshot_cached()
         if fans:
             info["fans"] = fans
+        if temps:
+            info["sensor_temps"] = temps
+        info["sensor_ready"] = ready
     except Exception:
         pass
     return info, cur

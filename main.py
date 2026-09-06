@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.35"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.36"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -418,7 +418,7 @@ class MiniOverlay(QWidget):
         底部：功耗结构票据式小表（每行名称+瓦数）+ 合计行。
         高度按各块实际像素累加。
         """
-        self.setFixedWidth(240)                  # v18.21: 224→240，电费行需 198px
+        self.setFixedWidth(320)                  # v18.36: 240→320，构成行四列（+使用率/温度）
         h = 20                                   # 上下边距 10+10
         # 顶部块（左：功率/状态；右：配置）+ 电费整行 + 功耗构成
         live_h = 0
@@ -465,37 +465,45 @@ class MiniOverlay(QWidget):
             except Exception:
                 pass
 
-    def _bd_row(self, name: str, watts: float, total: bool = False):
-        """v18.22 票据式一行：名称（右对齐）+ 瓦数（右对齐固定列）。"""
+    def _bd_row(self, name: str, watts: float, total: bool = False,
+                util_text: str = None, temp_text: str = None):
+        """v18.36 四列票据行：部件 | 使用率 | 功耗 W | 温度/转速。
+
+        温度列带 °（如 79°）= 温度、纯数字（如 1948）= 风扇转速。
+        total=True 时只有部件名与功耗（金色），中间两列留空。"""
         row = QWidget()
         row.setStyleSheet("background:transparent;")
         lay = QHBoxLayout(row)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
-        ln = QLabel(name)
-        ln.setStyleSheet("color:%s; font-size:10px;%s" % (
-            "#ffd28a" if total else "#b9cbe8",
-            " font-weight:700;" if total else ""))
-        ln.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        lv = QLabel("%.0f W" % watts)
-        lv.setStyleSheet("color:%s; font-size:10px;%s" % (
-            "#ffd28a" if total else "#eef3ff",
-            " font-weight:700;" if total else ""))
-        lv.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        lv.setFixedWidth(52)
-        lay.addWidget(ln, 1)
-        lay.addWidget(lv, 0)
-        # 行内文字同样加黑描边（无底板，浅色壁纸可见）
-        for _l in (ln, lv):
-            _sh = QGraphicsDropShadowEffect(_l)
+        def _lbl(text, color, w=None, bold=False):
+            lb = QLabel(text)
+            lb.setStyleSheet("color:%s; font-size:10px;%s" % (
+                color, " font-weight:700;" if bold else ""))
+            lb.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if w:
+                lb.setFixedWidth(w)
+            # 行内文字同样加黑描边（无底板，浅色壁纸可见）
+            _sh = QGraphicsDropShadowEffect(lb)
             _sh.setBlurRadius(8)
             _sh.setOffset(0, 0)
             _sh.setColor(QColor(0, 0, 0, 235))
-            _l.setGraphicsEffect(_sh)
+            lb.setGraphicsEffect(_sh)
+            return lb
+
+        c_name = "#ffd28a" if total else "#b9cbe8"
+        c_val = "#ffd28a" if total else "#eef3ff"
+        lay.addWidget(_lbl(name, c_name, bold=total), 1)
+        lay.addWidget(_lbl(util_text if util_text else "", "#9fb4d8", 34))
+        lay.addWidget(_lbl("%.0f W" % watts, c_val, 46, bold=total))
+        lay.addWidget(_lbl(temp_text if temp_text else "", "#9fb4d8", 40))
         return row
 
-    def set_breakdown(self, bd: dict):
-        """v18.22 票据式功耗结构：全部项按功耗降序逐行两列对齐，末尾合计行。"""
+    def set_breakdown(self, bd: dict, util: dict = None, temps: dict = None):
+        """v18.22 票据式功耗结构，v18.36 扩展四列（+使用率、温度/转速）。
+        util/temps：{部件名: 显示文本}；缺省该列留空。"""
+        util = util or {}
+        temps = temps or {}
         try:
             items = sorted(((str(k), float(v)) for k, v in (bd or {}).items()),
                            key=lambda kv: -kv[1])
@@ -509,7 +517,8 @@ class MiniOverlay(QWidget):
             _w.deleteLater()
         if items:
             for k, v in items:
-                _row = self._bd_row(k, v)
+                _row = self._bd_row(k, v, util_text=util.get(k),
+                                    temp_text=temps.get(k))
                 self.bd_rows.addWidget(_row)
                 self._bd_row_widgets.append(_row)
             _row = self._bd_row("合计", sum(v for _, v in items), total=True)
@@ -1077,7 +1086,7 @@ class MainWindow(QMainWindow):
         h.setStyleSheet("font-size:13px;color:#2b3552;font-weight:600;")
         lay.addWidget(h)
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["部件", "使用率", "功耗 W", "温度"])
+        self.table.setHorizontalHeaderLabels(["部件", "使用率", "功耗 W", "温度 / 转速"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -1194,7 +1203,11 @@ class MainWindow(QMainWindow):
         def gb(b):
             return f"{b / (1 << 30):.2f}GB" if b else "—"
 
-        cpu_t = dyn.get("cpu_temp")
+        # v18.36 CPU 温度兜底：主板热区（多数台式机为空）→ LHM Web Server；
+        # 主板温度同样来自 LHM（SuperIO），没装 LHM 时两处都显示 —。
+        st = dyn.get("sensor_temps") or {}
+        cpu_t = dyn.get("cpu_temp") or st.get("cpu")
+        board_t = st.get("motherboard")
         gpu_t = dyn.get("gpu_temp")
         mhz = dyn.get("mhz") or (s.get("mhz") or 0)
         vram = s.get("gpuvram")
@@ -1209,7 +1222,8 @@ class MainWindow(QMainWindow):
         LB = []   # 右列：显卡/磁盘
         # v18.35 「启动模式」按用户要求删除（UEFI/Legacy + SecureBoot 属低频
         # 信息，占一行空间不值）；v18.33 起运行时间/操作系统也已在顶部标题后
-        LA.append(f"<div style='margin:2px 0 3px 0;'>{Y}主　板{E} {self._short_model(g('mb'), 18)}</div>")
+        LA.append(f"<div style='margin:2px 0 3px 0;'>{Y}主　板{E} "
+                  f"{self._short_model(g('mb'), 18)} {self._temp_html(board_t, 55, 70)}</div>")
         cpu_name = (g('cpu') or self.hw.cpu_name or "—").strip()
         cpu_badge = (" <span style='color:#b8860b;font-weight:bold;'>⚠ 未识别</span>"
                      ) if getattr(self.model, "cpu_conf", "high") == "low" else ""
@@ -1217,11 +1231,12 @@ class MainWindow(QMainWindow):
                   f"{self._short_model(cpu_name, 18)}{cpu_badge}</div>")
         cpu_load = self.cur.get("cpu_load") if isinstance(self.cur, dict) else None
         cpu_load = 0.0 if cpu_load is None else cpu_load
+        # v18.36 按用户要求移除处理器/物理内存的 ASCII 使用率条：
+        # 使用率已由下方「功耗构成」表的进度条列统一呈现，此处只保留规格+温度。
         LA.append(f"<div style='{SUB}margin-bottom:3px;'>{g('cores') or '—'}核"
                   f"{g('threads') or '—'}线程 · {mhz / 1000.0:.2f}GHz · "
-                  f"{self._temp_html(cpu_t, 75, 85)}　{self._bar(cpu_load, 8)}</div>")
-        LA.append(f"<div style='margin-bottom:1px;'>{Y}物理内存{E} {gb(ram_total)}　"
-                  f"{self._bar(ram_pct, 8)}</div>")
+                  f"{self._temp_html(cpu_t, 75, 85)}</div>")
+        LA.append(f"<div style='margin-bottom:1px;'>{Y}物理内存{E} {gb(ram_total)}</div>")
         LA.append(f"<div style='{SUB}margin-bottom:3px;'>已用 {gb(ram_used)} · 可用 {gb(ram_free)}</div>")
         mods = (s.get("mods") or [])[:4]
         if mods:
@@ -1917,48 +1932,96 @@ class MainWindow(QMainWindow):
         return None
 
     @staticmethod
-    def _make_util_bar() -> QProgressBar:
+    def _make_util_cell() -> QWidget:
+        """v18.36 迷你进度条单元格：细条（10px）+ 右侧百分比文字。
+
+        之前 16px 实心条把单元格填满，视觉过硬；现单元格 22px 高、
+        进度条只占 10px 垂直居中（填充一半、留下一半），
+        百分比移到条右侧小标签（10px 条里塞文字会挤）。"""
+        w = QWidget()
+        w.setStyleSheet("background:transparent;")
+        w.setMinimumHeight(22)
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(5)
         pb = QProgressBar()
         pb.setRange(0, 100)
-        pb.setTextVisible(True)
-        pb.setFormat("—")
-        pb.setFixedHeight(16)
+        pb.setTextVisible(False)
+        pb.setFixedHeight(10)
         pb.setStyleSheet(
-            "QProgressBar{border:1px solid #d6dbe6;border-radius:3px;background:#f2f4f8;"
-            "text-align:center;font-size:10px;color:#2b3552;}"
-            "QProgressBar::chunk{background:#5aa832;border-radius:2px;}")
-        return pb
+            "QProgressBar{border:1px solid #d6dbe6;border-radius:5px;background:#f2f4f8;}"
+            "QProgressBar::chunk{background:#5aa832;border-radius:4px;margin:1px;}")
+        lb = QLabel("—")
+        lb.setStyleSheet("font-size:10px;color:#5a6478;")
+        lb.setFixedWidth(28)
+        lb.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        h.addWidget(pb, 1)
+        h.addWidget(lb)
+        w._bar, w._lbl = pb, lb
+        return w
 
-    def _update_util_bar(self, pb, name):
-        """v18.35 刷新进度条：值 + 档位颜色（<70 绿 / <90 橙 / ≥90 红）。
+    def _update_util_bar(self, cell, name):
+        """v18.36 刷新迷你进度条：值 + 档位颜色（<70 绿 / <90 橙 / ≥90 红）。
         颜色样式只在跨档时重设，避免每 2s 全表 setStyleSheet。"""
+        pb, lb = cell._bar, cell._lbl
         pct = self._util_pct(name)
         if pct is None:
             pb.setValue(0)
-            pb.setFormat("—")
+            lb.setText("—")
             return
-        pb.setFormat("%p%")
         pb.setValue(int(pct + 0.5))
+        lb.setText(f"{pct:.0f}%")
         col = "#5aa832" if pct < 70 else ("#d99a17" if pct < 90 else "#d8492f")
         if getattr(pb, "_chunk_col", None) != col:
             pb.setStyleSheet(
-                "QProgressBar{border:1px solid #d6dbe6;border-radius:3px;background:#f2f4f8;"
-                "text-align:center;font-size:10px;color:#2b3552;}"
-                f"QProgressBar::chunk{{background:{col};border-radius:2px;}}")
+                "QProgressBar{border:1px solid #d6dbe6;border-radius:5px;background:#f2f4f8;}"
+                f"QProgressBar::chunk{{background:{col};border-radius:4px;margin:1px;}}")
             pb._chunk_col = col
 
+    # v18.36 各部件温度告警/危险阈值（与 _temp_html 保持一致）
+    _TEMP_LIMITS = {"cpu": (75, 85), "gpu": (65, 78), "disk": (45, 55),
+                    "memory": (50, 60), "board": (55, 70)}
+
     def _temp_text_color(self, name):
-        """v18.35 构成表「温度」列：CPU/GPU/SSD/HDD 有传感器数据，其余 —。
-        返回 (文本, QColor|None)，阈值与侧栏 _temp_html 一致。"""
+        """v18.36 构成表「温度 / 转速」列。返回 (文本, QColor|None)。
+
+        数据来源（按优先级）：
+          CPU   — 主板热区计数器（Win32_PerfFormattedData...ThermalZone，多数
+                  台式机为空）→ LibreHardwareMonitor WMI（sensor_temps.cpu）
+          内存  — LHM WMI（sensor_temps.memory）；Windows 无免驱接口
+          主板  — LHM WMI（sensor_temps.motherboard）；同上
+          GPU   — nvidia-smi / ADL；磁盘 — StorageReliabilityCounter
+          风扇  — 无温度概念，改显示最高转速 RPM（LHM WMI）
+        没装 LHM 时 CPU/内存/主板/风扇显示 —（tooltip 会提示如何开启）。
+        """
         n = str(name).upper()
         dyn = getattr(self, "_sys_dyn", None) or {}
+        st = dyn.get("sensor_temps") or {}
         t = None
         warn, hot = 75, 85
+        if "风扇" in str(name):
+            # 风扇行显示转速而非温度：取所有风扇的最高转速
+            fans = dyn.get("fans") or []
+            if not fans:
+                return "—", None
+            rpm = max(int(v) for _n, v in fans)
+            col = QColor("#1a1a1a") if rpm < 1500 else (
+                QColor("#d99a17") if rpm < 2500 else QColor("#d8492f"))
+            return f"{rpm} RPM", col
         if "CPU" in n:
             t = dyn.get("cpu_temp")
+            if t is None:
+                t = st.get("cpu")
+            warn, hot = self._TEMP_LIMITS["cpu"]
         elif "GPU" in n:
             t = dyn.get("gpu_temp")
-            warn, hot = 65, 78
+            warn, hot = self._TEMP_LIMITS["gpu"]
+        elif "内存" in str(name):
+            t = st.get("memory")
+            warn, hot = self._TEMP_LIMITS["memory"]
+        elif "主板" in str(name) or "芯片" in str(name):
+            t = st.get("motherboard")
+            warn, hot = self._TEMP_LIMITS["board"]
         elif "SSD" in n or "HDD" in n:
             want = "SSD" if "SSD" in n else "HDD"
             temps = dyn.get("disk_temps") or {}
@@ -1967,7 +2030,7 @@ class MainWindow(QMainWindow):
                     t = temps.get(dk.get("model") or "")
                     if t is not None:
                         break
-            warn, hot = 45, 55
+            warn, hot = self._TEMP_LIMITS["disk"]
         if t is None:
             return "—", None
         col = QColor("#1a1a1a") if t < warn else (
@@ -1996,9 +2059,9 @@ class MainWindow(QMainWindow):
             r = self.table.rowCount()
             self.table.insertRow(r)
             self.table.setItem(r, 0, QTableWidgetItem(str(name)))
-            pb = self._make_util_bar()
-            self._update_util_bar(pb, name)
-            self.table.setCellWidget(r, 1, pb)
+            cell = self._make_util_cell()
+            self._update_util_bar(cell, name)
+            self.table.setCellWidget(r, 1, cell)
             vi = QTableWidgetItem(f"{bd[name]:.1f}")
             self.table.setItem(r, 2, vi)
             txt, col = self._temp_text_color(name)
@@ -2006,7 +2069,7 @@ class MainWindow(QMainWindow):
             ti.setForeground(col if col is not None else self._bd_temp_gray)
             self.table.setItem(r, 3, ti)
             self._bd_val_items.append(vi)
-            self._bd_util_bars.append(pb)
+            self._bd_util_bars.append(cell)
             self._bd_temp_items.append(ti)
         self._bd_keys = keys
 
@@ -3663,9 +3726,16 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         except Exception:
             m.lbl_temp.setText("")
         m._apply_size()
-        # v18.17 第四行：功耗构成
+        # v18.17 第四行：功耗构成；v18.36 四列（+使用率、温度/转速）
         try:
-            m.set_breakdown((self.cur or {}).get("breakdown") or {})
+            _bd = (self.cur or {}).get("breakdown") or {}
+            _util, _temp = {}, {}
+            for _k in _bd:
+                _p = self._util_pct(_k)
+                _util[_k] = f"{_p:.0f}%" if _p is not None else "—"
+                _t, _c = self._temp_text_color(_k)
+                _temp[_k] = _t
+            m.set_breakdown(_bd, _util, _temp)
         except Exception:
             pass
         # v18.19 右上角配置信息（硬件概要，取自启动时检测的本机配置）

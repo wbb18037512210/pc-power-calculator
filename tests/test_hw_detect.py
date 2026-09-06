@@ -172,18 +172,43 @@ hw4.monitor_count = 1
 check("monitor存在但无EDID时回退", PM.build_model(hw4).components["显示器"], 30.0)
 
 
-# ---------------------------------------------------------------- v18.35 风扇转速解析
-print("--- v18.35 风扇转速 ---")
-check("fans解析-数组过滤0值",
-      H._parse_fans_json('[{"Name":"CPU Fan","Value":1200.4},{"Name":"GPU","Value":0}]'),
-      [("CPU Fan", 1200)])
-check("fans解析-单对象", H._parse_fans_json('{"Name":"Fan1","Value":900}'), [("Fan1", 900)])
-check("fans解析-空串", H._parse_fans_json(""), [])
-check("fans解析-垃圾", H._parse_fans_json("not json"), [])
-check("fans解析-缺Value", H._parse_fans_json('[{"Name":"X"}]'), [])
+# ---------------------------------------------------------------- v18.36 传感器解析
+print("--- v18.36 传感器(LHM Web Server / WMI 回退) ---")
+# LHM /data.json 树解析：温度分类 + 坏通道过滤 + 风扇
+_lhm = """{"Text":"Root","Children":[
+ {"Text":"PC","Children":[
+  {"Text":"B450M","HardwareId":"/motherboard","Children":[
+   {"Text":"NCT6793D","HardwareId":"/lpc/nct6793d/0","Children":[
+    {"Text":"Temperatures","Children":[
+     {"Text":"Temperature #1","Type":"Temperature","Value":"28.5 °C"},
+     {"Text":"Temperature #4","Type":"Temperature","Value":"110.0 °C"}]},
+    {"Text":"Fans","Children":[
+     {"Text":"Fan #1","Type":"Fan","Value":"1937 RPM"},
+     {"Text":"Fan #2","Type":"Fan","Value":"0 RPM"}]}]}]},
+  {"Text":"Ryzen 5600X","HardwareId":"/amdcpu/0","Children":[
+   {"Text":"Temperatures","Children":[
+    {"Text":"CCD1 (Tdie)","Type":"Temperature","Value":"76.8 °C"},
+    {"Text":"Core (Tctl/Tdie)","Type":"Temperature","Value":"79.6 °C"},
+    {"Text":"Bogus","Type":"Temperature","Value":"-40 °C"}]}]},
+  {"Text":"RAM","HardwareId":"/ram/0","Children":[]}]}]}"""
+_f, _t, _r = H._parse_lhm_json(_lhm)
+check("LHM解析-ready", _r, True)
+check("LHM解析-CPU优先Tctl", _t.get("cpu"), 79.6)          # Tctl 优先于 CCD1
+check("LHM解析-主板温度", _t.get("motherboard"), 28.5)
+check("LHM解析-坏通道110°被过滤", "motherboard" in _t and _t["motherboard"] <= 100.0, True)
+check("LHM解析-无效-40°不计", _t.get("cpu"), 79.6)
+check("LHM解析-风扇取非零", _f, [("Fan #1", 1937)])
+_f, _t, _r = H._parse_lhm_json("not json")
+check("LHM解析-垃圾输入", (_f, _t, _r), ([], {}, False))
+# WMI 回退解析（OpenHardwareMonitor 老 JSON）
+_f, _t = H._parse_sensors('[{"Name":"CPU Fan","SensorType":"Fan","Value":1200.4},'
+                          '{"Name":"CPU Package","SensorType":"Temperature","Value":45.6},'
+                          '{"Name":"GPU","SensorType":"Fan","Value":0}]')
+check("WMI回退-风扇过滤0值", _f, [("CPU Fan", 1200)])
+check("WMI回退-CPU温度", _t.get("cpu"), 45.6)
 _r1 = H.fan_rpms_cached()
 _r2 = H.fan_rpms_cached()
-check("fans缓存-命中一致", _r1 == _r2, True)   # 第二次应走缓存（不 spawn PowerShell）
+check("fans缓存-命中一致", _r1 == _r2, True)   # 第二次应走缓存（不重复请求）
 
 
 print()
