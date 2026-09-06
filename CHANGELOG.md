@@ -5,6 +5,26 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.34 — 硬件信息并入实时卡片（删除最左侧栏）
+
+### 布局重构（用户反馈：截图红框标注）
+- 最左侧 288px 系统信息侧栏整体删除，硬件信息块（重新检测按钮 + 检测状态 +
+  AIDA64 风格富文本）并入**实时卡片右半区**（此前 v18.5 删除本机配置卡片后
+  一直空着的区域），横排比例 读数 3 : 硬件信息 2。
+- `_sysinfo_panel()` 从固定宽侧栏改为内嵌块，成员 `sysinfo_view` /
+  `_hw_detect_lbl` 名字不变，`_update_sysinfo` / `_redetect_hardware` 零改动；
+  信息区改浅灰圆角底（`#f7f9fc`）与白色卡片区分。
+- `_live_card` 末尾的"全标签 Ignored 防顶宽"需排除 `_hw_detect_lbl`
+  （Ignored 在横向 stretch 竞争下会被压成 0 宽——v18.33 副标题同款坑）。
+- `_refresh_header_static()` 增加 `_sys_static` 未初始化防御（_build_ui 里
+  标题行先于 _live_card 构建，调用顺序与旧版相反）。
+- 删除侧栏后主界面不再被 288px 顶宽，minimumSizeHint 592px（旧 ~1080）。
+
+### 测试
+- 全部 6 个测试文件 + test_headless 通过；视觉探针截图确认新布局。
+
+---
+
 ## v18.33 — 运行时间/操作系统上移标题行 + 详情独占屏幕
 
 ### 运行时间、操作系统移到主界面标题后（用户反馈）

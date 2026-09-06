@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.33"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.34"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -805,11 +805,10 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
-        outer = QHBoxLayout(root)
+        outer = QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        # v18：AIDA64 风格系统信息面板固定在最左侧
-        outer.addWidget(self._sysinfo_panel())
+        # v18.34 最左侧系统信息侧栏已删除，硬件信息整体并入实时卡片右侧
         page = QVBoxLayout()
         page.setContentsMargins(18, 16, 18, 16)
         page.setSpacing(14)
@@ -917,10 +916,15 @@ class MainWindow(QMainWindow):
         # 主界面被连带撑到 1983px（resize(1080) 形同虚设）。挪出来就好了。
         outer = QVBoxLayout(c); outer.setContentsMargins(16, 14, 16, 14)
         outer.setSpacing(8)
+        # v18.34 横排：左侧读数网格 + 右侧硬件信息块（原最左侧栏整体并入，
+        # 填补 v18.5 删除本机配置卡片后留下的右侧空白）。
+        row = QHBoxLayout(); row.setSpacing(16)
+        outer.addLayout(row, 1)
         # 4 列 x 2 行：7 个指标排一行时，光是大号数字就占掉约 1226px，
         # 主界面被迫跟着变宽。分两行后最小宽度约为 4 个指标。
         grid = QGridLayout(); grid.setHorizontalSpacing(16); grid.setVerticalSpacing(10)
-        outer.addLayout(grid)
+        row.addLayout(grid, 3)
+        row.addWidget(self._sysinfo_panel(), 2)
 
         # 插座功耗（大）
         col1 = QVBoxLayout(); col1.setSpacing(2)
@@ -994,7 +998,10 @@ class MainWindow(QMainWindow):
         # （如 "1,234.5 W"、"23:59:59"）各列会互相顶宽，卡片最小宽度从
         # 空态 792px 涨到 1232px，主界面又被撑开。改为可压缩：
         # 窄窗口下宁可让文字截断，也不要把窗口顶宽。
+        # v18.34 注意排除硬件信息块的操作行标签——Ignored 会把它压成 0 宽。
         for _lb in c.findChildren(QLabel):
+            if _lb is getattr(self, "_hw_detect_lbl", None):
+                continue
             _lb.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             _lb.setMinimumWidth(0)
 
@@ -1061,13 +1068,15 @@ class MainWindow(QMainWindow):
             _lb.setMinimumWidth(0)
         return c
 
-    # ---------------- 系统信息侧栏（AIDA64 风格，最左侧） ----------------
+    # ---------------- 系统信息块（v18.34 并入实时卡片右侧） ----------------
     def _refresh_header_static(self):
         """v18.33 标题后的操作系统文本（静态，采集/重检测后调用）。"""
         lbl = getattr(self, "_hdr_os", None)
         if lbl is None:
             return
-        s = self._sys_static or {}
+        # v18.34 _build_ui 里标题行先于 _live_card(内含 _sysinfo_panel)构建，
+        # _sys_static 可能尚未初始化，须防御。
+        s = getattr(self, "_sys_static", None) or {}
         os_txt = self._short_model(s.get("os"), 30)
         arch = (s.get("osarch") or "").strip()
         lbl.setText(" · ".join(x for x in (os_txt, arch) if x and x != "—"))
@@ -1086,20 +1095,28 @@ class MainWindow(QMainWindow):
         return (f"运行 {hh}时{mm:02d}分 · {now:%m-%d} [{wk}] {now:%H:%M}")
 
     def _sysinfo_panel(self) -> QWidget:
+        """v18.34 改为内嵌块：不再是最左侧固定宽侧栏，而是实时卡片右半区。
+
+        竖排 = 顶部操作行（重新检测硬件 + 检测状态） + 硬件信息富文本。
+        成员名 sysinfo_view / _hw_detect_lbl 保持不变，_update_sysinfo /
+        _redetect_hardware 无需改动。
+        """
         c = QWidget()
-        c.setFixedWidth(288)   # v18.17 收窄：主界面整体变窄
-        c.setStyleSheet("background:#ffffff;border-right:1px solid #e6e9ef;")
-        v = QVBoxLayout(c); v.setContentsMargins(8, 8, 8, 8); v.setSpacing(0)
+        v = QVBoxLayout(c)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
         self.sysinfo_view = QTextBrowser()
         self.sysinfo_view.setStyleSheet(
-            "QTextBrowser{background:#ffffff;color:#1a1a1a;border:none;"
-            "font-family:'Consolas','Microsoft YaHei';font-size:12px;}")
+            "QTextBrowser{background:#f7f9fc;color:#1a1a1a;"
+            "border:1px solid #eef1f6;border-radius:8px;"
+            "font-family:'Consolas','Microsoft YaHei';font-size:12px;"
+            "padding:8px 10px;}")
         self.sysinfo_view.setOpenExternalLinks(False)
         self.sysinfo_view.setFrameShape(QFrame.Shape.NoFrame)
         # v18.12 硬件重检测：插拔硬盘/显示器、换硬件后手动重建功耗模型，
         # 否则模型只在启动时构建一次，之后增减硬件估算值不会变。
         hdr = QWidget(); hh = QHBoxLayout(hdr)
-        hh.setContentsMargins(0, 0, 0, 6); hh.setSpacing(6)
+        hh.setContentsMargins(0, 0, 0, 0); hh.setSpacing(6)
         btn_rd = QPushButton("⟳ 重新检测硬件")
         btn_rd.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_rd.setToolTip("插拔硬盘 / 显示器、更换硬件后点此重建功耗模型。\n"
@@ -1107,7 +1124,7 @@ class MainWindow(QMainWindow):
                           "（校准数据与电源额定功率设置会保留）")
         btn_rd.setStyleSheet(
             "QPushButton{background:#f4f6fa;border:1px solid #d6dbe6;border-radius:5px;"
-            "padding:5px 10px;font-size:12px;color:#2f3b52;}"
+            "padding:3px 8px;font-size:12px;color:#2f3b52;}"
             "QPushButton:hover{background:#e8eefb;border-color:#9db4e8;}")
         btn_rd.clicked.connect(self._redetect_hardware)
         hh.addWidget(btn_rd)
