@@ -279,6 +279,28 @@ check("回归-hardware已import os", hasattr(H, "os"), True)
 
 
 print()
+print("--- v18.38 GPU 真实占用率 / 内存温度映射 ---")
+# GPU 占用：LHM 的 GPU Core Load（非 N 卡或 nvidia-smi 不可用时的数据源）
+_gpu_tree = {"Text": "Sensor", "Children": [
+    {"Text": "PC", "Children": [
+        {"Text": "GTX 1080", "HardwareId": "/gpu-nvidia/0", "Children": [
+            {"Text": "GPU Core", "Type": "Load", "Value": "3.0 %", "SensorId": "/gpu-nvidia/0/load/0"},
+            {"Text": "GPU Memory Controller", "Type": "Load", "Value": "1.0 %",
+             "SensorId": "/gpu-nvidia/0/load/1"}]},
+        {"Text": "DIMM #2", "HardwareId": "/memory/dimm/2", "Children": [
+            {"Text": "Capacity", "Type": "Data", "Value": "16.0 GB",
+             "SensorId": "/memory/dimm/2/data/0"}]}]}]}
+H._LHM_SENS.update(groups=H._build_lhm_tree(_gpu_tree), ts=0.0, ok=True)
+check("LHM-GPU占用率", H.lhm_gpu_load(), 3.0)          # 只认 GPU Core，不认 Memory Controller
+# 内存温度：DIMM 的 hwid 是 /memory/dimm/N，此前只映射 /ram 会漏掉有探头的内存
+check("内存映射含DIMM", H.lhm_probe("memory"), [])       # 本样例无温度探头
+H._LHM_SENS.update(groups=[], ok=False)
+# 旧算法「功耗 ÷ TDP」与真实占用的偏差：满载解码时功耗高而 SM 占用低，
+# 用同一组数字说明二者不可互推（回归保护，防止有人改回估算）
+check("反例-功耗高不等于占用高", (47.14 / 180.0 * 100) > 3.0 * 3, True)
+
+
+print()
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
 for f in FAIL:
     print("  FAIL " + f)

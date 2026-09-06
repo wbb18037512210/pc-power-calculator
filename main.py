@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.37"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.38"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -1603,6 +1603,8 @@ class MainWindow(QMainWindow):
                           data["gpu_valid"], disp_on)
         self.cur = {
             "cpu_load": data["cpu_load"], "gpu_power": data["gpu_power"],
+            # v18.38 GPU 真实占用率（nvidia-smi utilization.gpu），供使用率列显示
+            "gpu_util": data.get("gpu_util"),
             "gpu_valid": data["gpu_valid"], "wall": est["wall_watts"],
             "sys": est["sys_watts"], "breakdown": est["breakdown"],
             "display_on": disp_on,
@@ -1937,10 +1939,25 @@ class MainWindow(QMainWindow):
             v = self.cur.get("cpu_load") if isinstance(self.cur, dict) else None
             return max(0.0, float(v)) if v is not None else None
         if "GPU" in n:
+            # v18.38 真实占用率优先：nvidia-smi utilization.gpu（与任务管理器同口径）
+            # → LHM 的 GPU Core Load（A 卡/无 nvidia-smi）→ 功耗÷TDP 兜底（标注估算）。
+            u = self.cur.get("gpu_util") if isinstance(self.cur, dict) else None
+            if u is not None:
+                self._gpu_util_src = "nvidia-smi"
+                return max(0.0, min(100.0, float(u)))
+            try:
+                u = H.lhm_gpu_load()
+            except Exception:
+                u = None
+            if u is not None:
+                self._gpu_util_src = "LHM"
+                return u
             gp = self.cur.get("gpu_power") if isinstance(self.cur, dict) else None
             tdp = float(getattr(self.model, "gpu_tdp", 0) or 0)
             if gp is not None and tdp > 0:
+                self._gpu_util_src = "估算"
                 return min(100.0, float(gp) / tdp * 100)
+            self._gpu_util_src = None
             return None
         if "内存" in str(name):
             v = (getattr(self, "_sys_dyn", None) or {}).get("ram_pct")
@@ -2080,6 +2097,10 @@ class MainWindow(QMainWindow):
                 return ("未连接到 LibreHardwareMonitor\n"
                         "温度/转速需经其 Web Server（127.0.0.1:8085）读取\n"
                         "（Windows 免驱读不到 SuperIO/EC 芯片）")
+            if "内存" in s:
+                return ("内存温度读不到：本机的内存条没有 SPD 温度探头\n"
+                        "（LHM 只能读到容量与 SPD 时序；DDR5 / 部分高端 DDR4 才有温度探头）\n"
+                        "这是硬件限制，HWiNFO、AIDA64 等同样读不到")
             return ("LibreHardwareMonitor 未报告「%s」的温度/转速\n"
                     "该部件本身通常不带温度探头（属正常现象）" % s)
         return ("LibreHardwareMonitor 参考读数\n"
@@ -2088,6 +2109,8 @@ class MainWindow(QMainWindow):
     def open_sensors(self):
         """v18.37 传感器详情：照 LHM 的分组方式列出温度/风扇/控制等原始读数。"""
         TYPES = ("Temperature", "Fan", "Control", "Power", "Clock", "Load")
+        TYPES_ALL = TYPES + ("Data", "Timing", "Voltage", "Current",
+                             "Level", "Throughput", "Factor", "SmallData")
         d = QDialog(self)
         d.setWindowTitle("传感器详情 · LibreHardwareMonitor")
         d.resize(760, 580)
@@ -2108,6 +2131,8 @@ class MainWindow(QMainWindow):
             _hh.setSectionResizeMode(_i, QHeaderView.ResizeToContents)
         vl.addWidget(tree, 1)
 
+        _show_all = {"v": False}
+
         def _fill():
             try:
                 snap = H.lhm_sensors(force=True)
@@ -2115,8 +2140,9 @@ class MainWindow(QMainWindow):
                 snap = {"ok": False, "groups": []}
             tree.setRowCount(0)
             n = 0
+            _ty = TYPES_ALL if _show_all["v"] else TYPES
             for g in snap.get("groups") or []:
-                ss = [x for x in (g.get("sensors") or []) if x.get("type") in TYPES]
+                ss = [x for x in (g.get("sensors") or []) if x.get("type") in _ty]
                 if not ss:
                     continue
                 r = tree.rowCount()
@@ -2170,6 +2196,10 @@ class MainWindow(QMainWindow):
 
         _fill()
         bar = QHBoxLayout()
+        ck_all = QCheckBox("显示全部传感器（含内存 SPD 时序/容量）")
+        ck_all.toggled.connect(lambda v: (_show_all.__setitem__("v", v), _fill()))
+        bar.addWidget(ck_all)
+        bar.addStretch(1)
         btn_ref = QPushButton("刷新")
         btn_ref.setObjectName("ghost")
         btn_close = QPushButton("关闭")
@@ -2187,6 +2217,20 @@ class MainWindow(QMainWindow):
         if c == 3:
             self.open_sensors()
 
+    def _util_tip(self, name):
+        """v18.38 使用率列的来源说明：GPU 行标注占用率是实测还是功耗估算。"""
+        n = str(name).upper()
+        if "GPU" in n:
+            src = getattr(self, "_gpu_util_src", None)
+            if src == "nvidia-smi":
+                return "GPU 使用率：nvidia-smi 实测 SM 占用（与任务管理器同口径）"
+            if src == "LHM":
+                return "GPU 使用率：LibreHardwareMonitor 的 GPU Core 占用"
+            if src == "估算":
+                return ("GPU 使用率：由「功耗 ÷ TDP」估算\n"
+                        "未取到实测占用（nvidia-smi 不可用且非 LHM 可识别显卡）")
+        return ""
+
     def _refresh_breakdown(self):
         bd = self.cur.get("breakdown", {})
         keys = self._sorted_bd_keys(list(bd.keys()))
@@ -2196,6 +2240,7 @@ class MainWindow(QMainWindow):
                                           self._bd_util_bars, self._bd_temp_items):
                 item.setText(f"{bd[name]:.1f}")
                 self._update_util_bar(pb, name)
+                pb.setToolTip(self._util_tip(name))
                 txt, col = self._temp_text_color(name)
                 ti.setText(txt)
                 ti.setForeground(col if col is not None else self._bd_temp_gray)
@@ -2212,6 +2257,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(r, 0, QTableWidgetItem(str(name)))
             cell = self._make_util_cell()
             self._update_util_bar(cell, name)
+            cell.setToolTip(self._util_tip(name))
             self.table.setCellWidget(r, 1, cell)
             vi = QTableWidgetItem(f"{bd[name]:.1f}")
             self.table.setItem(r, 2, vi)

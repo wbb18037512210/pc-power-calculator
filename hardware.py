@@ -307,10 +307,31 @@ def lhm_sensors(force: bool = False) -> dict:
 _LHM_KIND_PREFIX = (
     ("/amdcpu", "cpu"), ("/intelcpu", "cpu"),
     ("/lpc", "motherboard"), ("/motherboard", "motherboard"),
-    ("/ram", "memory"),
+    ("/ram", "memory"), ("/memory", "memory"),   # DIMM 是 /memory/dimm/N
     ("/gpu", "gpu"),
     ("/nvme", "disk"), ("/hdd", "disk"),
 )
+
+
+def lhm_gpu_load():
+    """LHM 的 GPU Core 占用率（%）：非 N 卡或 nvidia-smi 不可用时的真实占用来源。
+
+    与任务管理器「GPU 利用率」同一口径（LHM 对 N 卡读 NVML、A 卡读 ADL/GPU 节点）。
+    """
+    for g in _LHM_SENS.get("groups") or []:
+        if not (g.get("hwid") or "").startswith("/gpu"):
+            continue
+        for sn in g.get("sensors") or []:
+            if sn.get("type") != "Load":
+                continue
+            low = (sn.get("name") or "").lower()
+            if low == "gpu core" or (low.startswith("gpu core") and "memory" not in low):
+                try:
+                    v = float((sn.get("value") or "").split()[0])
+                except (ValueError, IndexError):
+                    return None
+                return max(0.0, min(100.0, v))
+    return None
 
 
 def lhm_probe(kind: str):
@@ -883,7 +904,8 @@ class PersistentSampler:
         self.gpu_nvidia = bool(gpu_nvidia)
         self._gpu_proc = None
         self._lock = threading.Lock()
-        self._gpu_val = (None, None, False, 0.0)  # (功耗W, GPU温度°C, valid, ts)
+        # (功耗W, GPU温度°C, GPU占用率%, valid, ts)
+        self._gpu_val = (None, None, None, False, 0.0)
         self._psutil = None
         self._net_prev = None
         self._n_samples = 0
@@ -901,7 +923,10 @@ class PersistentSampler:
         if self.gpu_nvidia:
             try:
                 self._gpu_proc = subprocess.Popen(
-                    ["nvidia-smi", "--query-gpu=power.draw,temperature.gpu",
+                    # v18.38 增加 utilization.gpu：GPU 使用率取真实 SM 占用，
+                    # 不再用「功耗 ÷ TDP」估算（后者空载也有 8~10%，与任务管理器差很远）
+                    ["nvidia-smi",
+                     "--query-gpu=power.draw,temperature.gpu,utilization.gpu",
                      "--format=csv,noheader,nounits",
                      "-l", str(max(1, self.interval_ms // 1000))],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -939,8 +964,14 @@ class PersistentSampler:
                     parts = s.split(",")
                     v = float(parts[0])
                     temp = float(parts[1]) if len(parts) > 1 else None
+                    util = None
+                    if len(parts) > 2:
+                        try:
+                            util = max(0.0, min(100.0, float(parts[2])))
+                        except ValueError:
+                            util = None
                     with self._lock:
-                        self._gpu_val = (v, temp, True, time.time())
+                        self._gpu_val = (v, temp, util, True, time.time())
                 except Exception:
                     continue
         except Exception:
@@ -968,7 +999,7 @@ class PersistentSampler:
         now = time.time()
         stale = max(3.0 * self.interval_ms / 1000.0, self._STALE_MIN)
         with self._lock:
-            gpu_p, gpu_t, _gpu_ok, gpu_ts = self._gpu_val
+            gpu_p, gpu_t, gpu_u, _gpu_ok, gpu_ts = self._gpu_val
         gpu_fresh = gpu_ts > 0 and (now - gpu_ts) <= stale
         self._n_samples += 1
         # v18.2/v18.3：温度探测（spawn PS 可达数秒）放独立线程，绝不阻塞 sample()
@@ -988,6 +1019,7 @@ class PersistentSampler:
         return {
             "cpu_load": float(self._psutil.cpu_percent(interval=None)),
             "gpu_power": gpu_p if (self.gpu_nvidia and gpu_fresh) else None,
+            "gpu_util": gpu_u if (self.gpu_nvidia and gpu_fresh) else None,
             "gpu_valid": bool(self.gpu_nvidia and gpu_fresh),
             "apps": (now, self._collect_apps()),
             "sys": sysinfo,

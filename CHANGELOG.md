@@ -5,6 +5,36 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.38 — GPU 使用率改实测占用 + 内存温度无探头的说明
+
+### GPU 使用率不再用「功耗 ÷ TDP」估算（用户反馈与任务管理器差距大）
+- **根因**：此前使用率列对 GPU 用 `功耗 ÷ TDP` 推算，但那是**功率利用率**，
+  不是 SM 占用率。功耗里含风扇、显存、供电损耗等固定开销，且硬件解码走的是
+  Video Engine 专用引擎 —— 功耗上去了、SM 占用几乎不动。
+  本机实测样本：**功耗 47.1W（估算 26%）时真实占用只有 3%，偏差 +23 个百分点**。
+- 改为真实占用，三级取值：
+  1. `nvidia-smi utilization.gpu`（常驻流加查该字段，与任务管理器同口径）
+  2. LHM 的 `GPU Core` Load（A 卡 / 无 nvidia-smi 时的真实来源）
+  3. 功耗 ÷ TDP（仅在两者都拿不到时兜底）
+- N 卡常驻流查询字段：`power.draw,temperature.gpu,utilization.gpu`。
+- 使用率列新增 tooltip 标注来源（实测 / 估算），避免"这数哪来的"的疑问。
+- 实测校验：连续 6 次采样与 nvidia-smi 直查完全一致（8~9% vs 8~9%）。
+
+### 内存温度：说明清楚为什么读不到
+- 补充 LHM 硬件映射：DIMM 的 HardwareId 是 `/memory/dimm/N`，此前只映射 `/ram`，
+  带 SPD 探头的内存条会被漏掉（DDR5 / 部分高端 DDR4）—— 已修正，有探头即可显示。
+- **本机两条内存（Micron DDR4 + 兴嘉辰 DDR4）没有 SPD 温度探头**，LHM 只报容量
+  与 SPD 时序、无 Temperature，属硬件限制（HWiNFO、AIDA64 同样读不到）。
+  温度列 tooltip 现在明确说明这一点，而不是给一个让人以为是软件故障的 —。
+- 传感器详情窗口新增「显示全部传感器」勾选：可查看内存的容量与 SPD 时序
+  （默认视图只显示温度/风扇/控制/功耗/频率/占用，130 行 → 全部 254 行）。
+
+### 其他
+- 单测 `tests/test_hw_detect.py` +3 项（LHM GPU 占用解析 / DIMM 映射 /
+  功耗≠占用的反例回归），共 75 项全通过；`test_headless.py` 全通过。
+
+---
+
 ## v18.37 — 温度/转速以 LibreHardwareMonitor 为参考显示 + 修 ensure_lhm 崩溃
 
 ### 以 LHM 为参考显示温度/转速
