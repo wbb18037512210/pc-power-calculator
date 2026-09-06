@@ -240,6 +240,34 @@ def _parse_lhm_json(text: str):
     return fans, temps, True
 
 
+_LHM_EXE = r"D:\tools\LibreHardwareMonitor\LibreHardwareMonitor.exe"
+_lhm_launch_state = {"last": 0.0}
+
+
+def ensure_lhm():
+    """传感器查询失败且 LHM 未运行时，静默拉起（10 分钟节流，防止反复 spawn）。
+
+    LHM 的 WMI/HTTP 数据只在它运行期间存在；窗口被误关或进程退出后
+    CPU/主板温度与风扇转速就会全部变 —。这里做无人值守自愈：
+    路径存在 + 进程不在 → 分离方式启动（不阻塞采样线程、无窗口闪挂）。
+    """
+    if not os.path.exists(_LHM_EXE):
+        return
+    now = time.time()
+    if now - _lhm_launch_state["last"] < 600:
+        return
+    _lhm_launch_state["last"] = now
+    try:
+        out = _ps("(Get-Process LibreHardwareMonitor -ErrorAction SilentlyContinue) "
+                  "-ne $null", timeout=6)
+        if (out or "").strip().lower() == "true":
+            return
+        subprocess.Popen([_LHM_EXE], creationflags=0x00000008,   # DETACHED_PROCESS
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def _query_sensors():
     """优先 LibreHardwareMonitor Web Server（v0.9+ 已移除 WMI Provider），
     回退 OpenHardwareMonitor WMI（老版有 WMI）。返回 (fans, temps, ready)。"""
@@ -262,6 +290,7 @@ def _query_sensors():
         fans, temps = _parse_sensors(out)
         if fans or temps:
             return fans, temps, True
+    ensure_lhm()
     return [], {}, False
 
 

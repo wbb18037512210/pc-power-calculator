@@ -1093,6 +1093,10 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.verticalHeader().hide()
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        # v18.36 纯展示表禁用选择：首行默认 currentRow 的蓝色 selection
+        # 会透过进度条单元格的透明容器渗出（EXE 冒烟实测 CPU 行出现蓝色大块）
+        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         lay.addWidget(self.table, 1)
         # PSU 建议
         self.psu_hint = QLabel("")
@@ -1933,49 +1937,46 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _make_util_cell() -> QWidget:
-        """v18.36 迷你进度条单元格：细条（10px）+ 右侧百分比文字。
-
-        之前 16px 实心条把单元格填满，视觉过硬；现单元格 22px 高、
-        进度条只占 10px 垂直居中（填充一半、留下一半），
-        百分比移到条右侧小标签（10px 条里塞文字会挤）。"""
+        """v18.36 使用率进度条：横向铺满单元格，高度 20px，
+        百分比文字居中显示在条内（用户指定）。无数据时显示 —。"""
         w = QWidget()
         w.setStyleSheet("background:transparent;")
-        w.setMinimumHeight(22)
+        w.setMinimumHeight(24)
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(5)
+        h.setSpacing(0)
         pb = QProgressBar()
         pb.setRange(0, 100)
-        pb.setTextVisible(False)
-        pb.setFixedHeight(10)
+        pb.setTextVisible(True)
+        pb.setFormat("—")
+        pb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pb.setFixedHeight(20)
         pb.setStyleSheet(
-            "QProgressBar{border:1px solid #d6dbe6;border-radius:5px;background:#f2f4f8;}"
-            "QProgressBar::chunk{background:#5aa832;border-radius:4px;margin:1px;}")
-        lb = QLabel("—")
-        lb.setStyleSheet("font-size:10px;color:#5a6478;")
-        lb.setFixedWidth(28)
-        lb.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            "QProgressBar{border:1px solid #d6dbe6;border-radius:4px;background:#f2f4f8;"
+            "text-align:center;font-size:10px;color:#2b3552;}"
+            "QProgressBar::chunk{background:#5aa832;border-radius:3px;margin:1px;}")
         h.addWidget(pb, 1)
-        h.addWidget(lb)
-        w._bar, w._lbl = pb, lb
+        w._bar = pb
+        w._lbl = None          # v18.36b 百分比移回条内居中，右侧标签取消
         return w
 
     def _update_util_bar(self, cell, name):
-        """v18.36 刷新迷你进度条：值 + 档位颜色（<70 绿 / <90 橙 / ≥90 红）。
+        """刷新使用率进度条：百分比居中 + 档位颜色（<70 绿 / <90 橙 / ≥90 红）。
         颜色样式只在跨档时重设，避免每 2s 全表 setStyleSheet。"""
-        pb, lb = cell._bar, cell._lbl
+        pb = cell._bar
         pct = self._util_pct(name)
         if pct is None:
             pb.setValue(0)
-            lb.setText("—")
+            pb.setFormat("—")
             return
+        pb.setFormat("%p%")
         pb.setValue(int(pct + 0.5))
-        lb.setText(f"{pct:.0f}%")
         col = "#5aa832" if pct < 70 else ("#d99a17" if pct < 90 else "#d8492f")
         if getattr(pb, "_chunk_col", None) != col:
             pb.setStyleSheet(
-                "QProgressBar{border:1px solid #d6dbe6;border-radius:5px;background:#f2f4f8;}"
-                f"QProgressBar::chunk{{background:{col};border-radius:4px;margin:1px;}}")
+                "QProgressBar{border:1px solid #d6dbe6;border-radius:4px;background:#f2f4f8;"
+                "text-align:center;font-size:10px;color:#2b3552;}"
+                f"QProgressBar::chunk{{background:{col};border-radius:3px;margin:1px;}}")
             pb._chunk_col = col
 
     # v18.36 各部件温度告警/危险阈值（与 _temp_html 保持一致）
