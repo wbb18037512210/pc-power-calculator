@@ -56,9 +56,9 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.31"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.32"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
-SAMPLE_MS = 2000
+SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
 PSU_COMMON = (300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 1000)
 # v18.11 手动标记「显示器已关」后，若检测到键鼠空闲短于该值，
@@ -618,6 +618,28 @@ class MiniOverlay(QWidget):
         self._drag = None
 
 
+class ChartView(QChartView):
+    """v18.32 主界面功耗曲线视图。
+
+    双击行为分两种模式：
+    · on_double_click 给了回调（主界面）：双击打开曲线详情大图；
+    · 未给回调（详情大图内）：双击复位缩放（配合 rubber band 框选放大）。
+    """
+
+    def __init__(self, chart, on_double_click=None, parent=None):
+        super().__init__(chart, parent)
+        self._on_dbl = on_double_click
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            if callable(self._on_dbl):
+                self._on_dbl()
+                return
+            self.chart().zoomReset()     # 详情模式：双击复位
+            return
+        super().mouseDoubleClickEvent(e)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -740,7 +762,6 @@ class MainWindow(QMainWindow):
         self.cur = {"cpu_load": 0.0, "gpu_power": None, "gpu_valid": False,
                     "wall": 0.0, "sys": 0.0, "breakdown": {}}
         # 性能：样式档位缓存（颜色没变就不重复 setStyleSheet，避免每帧重绘）
-        self._budget_col = None
         self._idle_col = None
         # 软件耗电：按进程 CPU 时间增量分摊 CPU 估算功耗（运行时累计，不持久化）
         self.app_cpu_snap = (0.0, {})   # (ts, {进程名: 累计CPU秒})
@@ -932,21 +953,8 @@ class MainWindow(QMainWindow):
             row.addWidget(cap_lbl); row.addWidget(w, 1)
             col5.addLayout(row); self._proj_rows.append(row)
 
-        # 月度预算进度
-        col6 = QVBoxLayout(); col6.setSpacing(2)
-        col6.addWidget(self._lbl("月度预算", "title"))
-        self.budget_big = self._lbl("未设", "big")
-        col6.addWidget(self.budget_big)
-        self.budget_bar = QProgressBar()
-        self.budget_bar.setRange(0, 100); self.budget_bar.setValue(0)
-        self.budget_bar.setTextVisible(False)
-        self.budget_bar.setFixedHeight(9)
-        self.budget_bar.setStyleSheet(
-            "QProgressBar{border:none;border-radius:5px;background:#eef1f7;}"
-            "QProgressBar::chunk{background:#2fae6b;border-radius:5px;}")
-        col6.addWidget(self.budget_bar)
-        self.budget_sub = self._lbl("", "sub")
-        col6.addWidget(self.budget_sub)
+        # v18.32 主界面移除「月度预算」卡片（用户要求）：预算功能本身保留——
+        # 设置面板可设、达到阈值仍弹预警通知、报告内仍有预算进度。
 
         # 待机占比
         col7 = QVBoxLayout(); col7.setSpacing(2)
@@ -958,12 +966,12 @@ class MainWindow(QMainWindow):
 
         # 详解行独占整行：最长的一句，给它完整宽度，避免撑宽上面 7 列
         self.wall_sub = self._lbl(
-            "直流 0.0 W + 电源损耗 0.0 W = 插座 0.0 W（效率 0.85）", "sub")
+            "插座 0.0 W ＝ 直流 0.0 + 损耗 0.0 · 效率 0.85", "sub")
         self.wall_sub.setWordWrap(True)
         self.wall_sub.setMinimumWidth(0)
         outer.addWidget(self.wall_sub)
 
-        for _i, _col in enumerate((col1, col2, col3, col4, col5, col6, col7)):
+        for _i, _col in enumerate((col1, col2, col3, col4, col5, col7)):
             grid.addLayout(_col, _i // 4, _i % 4)
 
         # v18.17 QLabel 默认「最小宽度 = 整段文本宽度」。填上真实数据后
@@ -980,7 +988,7 @@ class MainWindow(QMainWindow):
         c = QWidget(); self._card(c)
         lay = QVBoxLayout(c); lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(8)
-        h = QLabel("功耗曲线（近 60 分钟 · 插座功耗 W）")
+        h = QLabel("功耗曲线（近 60 分钟 · 插座功耗 W）· 双击查看详情")
         h.setStyleSheet("font-size:13px;color:#2b3552;font-weight:600;")
         lay.addWidget(h)
         self.series = QLineSeries()
@@ -1003,7 +1011,8 @@ class MainWindow(QMainWindow):
         self._chart_pts = deque()          # 与 series 同步的 (ts_ms, W) 镜像
         self._chart_xbucket = -1           # x 轴范围 15s 快照桶，避免每帧重排版
         self._chart_max_bucket = -1        # y 轴量程变化去抖
-        self.chart_view = QChartView(self.chart)
+        # v18.32 双击曲线 -> 打开大图详情（open_chart_detail）
+        self.chart_view = ChartView(self.chart, on_double_click=self.open_chart_detail)
         self.chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
         # v18.17 QChartView 自带较大的最小尺寸，是「中间一行」顶宽主界面的主因
         self.chart_view.setMinimumWidth(0)
@@ -1087,111 +1096,108 @@ class MainWindow(QMainWindow):
         col = "#1a1a1a" if t < warn else ("#d99a17" if t < hot else "#d8492f")
         return f"<span style='color:{col}'>{t:.0f}°</span>"
 
+    @staticmethod
+    def _short_model(name, maxlen: int = 26) -> str:
+        """v18.32 窄侧栏显示用的硬件型号精简：去噪音后缀、去料号、超长截断。
+
+        例：'AMD Ryzen 5 5600X 6-Core Processor' -> 'AMD Ryzen 5 5600X'；
+            'ST1000LM035-1RK174' -> 'ST1000LM035'（- 后多为固件/料号）。
+        """
+        import re as _re
+        n = (str(name or "")).strip()
+        n = _re.sub(r"\s*@.*$", "", n)                          # @ 3.70GHz
+        n = _re.sub(r"\s+\d+\s*[-~]?\s*[cC]ore\s+Processor\s*$", "", n)  # 6-Core Processor
+        n = n.replace(" Processor", "").replace(" CPU", "")
+        n = _re.sub(r"^Microsoft\s+", "", n)                    # Microsoft Windows -> Windows
+        n = _re.sub(r"\s+Family\s+Controller\s*$", "", n)       # Realtek ... Family Controller
+        if len(n) > maxlen:
+            head = n.split("-", 1)[0]                           # 盘型号取 '-' 前段
+            n = head if len(head) >= 6 and len(head) <= maxlen else (n[:maxlen - 1] + "…")
+        return n or "—"
+
     def _build_sysinfo_html(self) -> str:
+        # v18.32 简化版：288px 窄栏下旧版一行塞 3 个字段必然折行错乱。
+        # 原则：一行一主题、子行只缩进 12px、砍低价值字段（TPM/域/BIOS 版本/
+        # Cache 容量/插槽数/MAC/网关/DPI），型号统一经 _short_model 精简。
         s = self._sys_static or {}
         dyn = self._sys_dyn or {}
         g = s.get
-        import datetime as _dt
         boot = dyn.get("boot")
         if boot:
             up = max(0, time.time() - boot)
-            hh, rem = divmod(int(up), 3600); mm, ss = divmod(rem, 60)
-            uptime = f"{hh:02d}时{mm:02d}分{ss:02d}秒"
+            hh, rem = divmod(int(up), 3600); mm, _ss = divmod(rem, 60)
             now = datetime.now()
             wk = "一二三四五六日"[now.weekday()]
-            upt_line = f"{uptime}　{now:%Y-%m-%d} [{wk}] {now:%H:%M:%S}"
+            upt_line = f"{hh}时{mm:02d}分　{now:%m-%d} [{wk}] {now:%H:%M}"
         else:
             upt_line = "—"
-        # 内存
         ram_total = dyn.get("ram_total") or self.hw.ram_bytes or 0
         ram_used = dyn.get("ram_used") or 0
         ram_free = ram_total - ram_used
         ram_pct = dyn.get("ram_pct") or 0.0
+
         def gb(b):
             return f"{b / (1 << 30):.2f}GB" if b else "—"
+
         cpu_t = dyn.get("cpu_temp")
         gpu_t = dyn.get("gpu_temp")
         mhz = dyn.get("mhz") or (s.get("mhz") or 0)
-        dpi = 96
-        try:
-            from PySide6.QtWidgets import QApplication as _QA
-            scr = _QA.primaryScreen()
-            if scr:
-                dpi = int(scr.logicalDotsPerInch())
-        except Exception:
-            pass
         vram = s.get("gpuvram")
         vram_txt = f"{vram / (1 << 30):.0f}GB" if vram else "—"
         fw = s.get("fw") or ""
         fw_txt = "UEFI" if fw == "UEFI" else ("BIOS" if "Legacy" in fw else (fw or "—"))
-        sb_txt = "启用" if s.get("sb") == 1 else ("关闭" if fw_txt == "UEFI" else "—")
+        sb_txt = "SB开" if s.get("sb") == 1 else ("SB关" if fw_txt == "UEFI" else "")
         Y = "<span style='color:#111111;font-weight:bold'>"   # v18.5 白底黑字：标签黑色加粗
         E = "</span>"
+        SUB = "margin-left:12px;color:#555555;"
         L = []
         L.append(f"<div style='margin:2px 0 6px 0;'>{Y}运行时间{E} {upt_line}</div>")
-        L.append(f"<div style='margin-bottom:6px;'>{Y}操作系统{E} {g('os') or '—'} "
-                 f"{g('osarch') or ''} 10.0.{g('osver') or ''}</div>")
-        L.append(f"<div style='margin-bottom:6px;'>{Y}启动模式{E} {fw_txt}　"
-                 f"安全引导: {sb_txt}　TPM模块: {g('tpm') or '—'}</div>")
-        L.append(f"<div style='margin-bottom:6px;'>{Y}计算机名{E} {g('comp') or '—'} ({g('domain') or '—'})</div>")
-        L.append(f"<div style='margin-bottom:6px;'>{Y}主板型号{E} {g('mb') or '—'}</div>")
-        L.append(f"<div style='margin-bottom:6px;'>{Y}主板Bios{E} Ver: {g('bios') or '—'}</div>")
+        L.append(f"<div style='margin-bottom:6px;'>{Y}操作系统{E} {self._short_model(g('os'), 30)} "
+                 f"{g('osarch') or ''}</div>")
+        L.append(f"<div style='margin-bottom:6px;'>{Y}启动模式{E} {fw_txt}"
+                 + (f"　{sb_txt}" if sb_txt else "") + "</div>")
+        L.append(f"<div style='margin-bottom:6px;'>{Y}主　　板{E} {self._short_model(g('mb'), 24)}</div>")
         cpu_name = (g('cpu') or self.hw.cpu_name or "—").strip()
-        cpu_badge = (" <span style='color:#b8860b;font-weight:bold;'>"
-                     "⚠ 型号未识别·估算可能偏差，建议校准</span>"
+        cpu_badge = (" <span style='color:#b8860b;font-weight:bold;'>⚠ 未识别</span>"
                      ) if getattr(self.model, "cpu_conf", "high") == "low" else ""
-        L.append(f"<div style='margin-bottom:2px;'>{Y}处 理 器{E} {cpu_name}{cpu_badge}</div>")
-        L.append(f"<div style='margin:0 0 2px 46px;'>核心: {g('cores') or '—'} × 线程: "
-                 f"{g('threads') or '—'}　频率: {mhz / 1000.0:.2f} GHz　{self._temp_html(cpu_t, 75, 85)}</div>")
-        def kb2mb(v):
-            try:
-                kb = int(v)
-                return f"{kb / 1024.0:.0f}MB" if kb >= 1024 else f"{kb}KB"
-            except Exception:
-                return "—"
-        L.append(f"<div style='margin:0 0 2px 46px;'>Cache缓存 L1={kb2mb(g('l1'))}　"
-                 f"L2={kb2mb(g('l2'))}　L3={kb2mb(g('l3'))}</div>")
+        L.append(f"<div style='margin-bottom:1px;'>{Y}处 理 器{E} "
+                 f"{self._short_model(cpu_name)}{cpu_badge}</div>")
         cpu_load = self.cur.get("cpu_load") if isinstance(self.cur, dict) else None
-        if cpu_load is None:
-            cpu_load = 0.0
-        L.append(f"<div style='margin:0 0 8px 46px;'>利用率: {self._bar(cpu_load)}</div>")
-        L.append(f"<div style='margin-bottom:2px;'>{Y}物理内存{E} 总内存: {gb(ram_total)}　"
-                 f"插槽数: {g('slots') or '—'}　最大支持: "
-                 f"{int((g('maxcap') or 0) / (1 << 20))}GB</div>")
-        L.append(f"<div style='margin:0 0 2px 46px;'>已使用: {gb(ram_used)}　"
-                 f"可使用: {gb(ram_free)}</div>")
-        L.append(f"<div style='margin:0 0 2px 46px;'>使用率: {self._bar(ram_pct)}</div>")
+        cpu_load = 0.0 if cpu_load is None else cpu_load
+        L.append(f"<div style='{SUB}margin-bottom:6px;'>{g('cores') or '—'}核"
+                 f"{g('threads') or '—'}线程 · {mhz / 1000.0:.2f}GHz · "
+                 f"{self._temp_html(cpu_t, 75, 85)}　{self._bar(cpu_load, 8)}</div>")
+        L.append(f"<div style='margin-bottom:1px;'>{Y}物理内存{E} {gb(ram_total)}　"
+                 f"{self._bar(ram_pct, 8)}</div>")
+        L.append(f"<div style='{SUB}margin-bottom:3px;'>已用 {gb(ram_used)} · 可用 {gb(ram_free)}</div>")
         for m in (s.get("mods") or [])[:4]:
-            mn = (m.get("m") or "").replace("Unknown", "GeIL")
+            mn = (m.get("m") or "").replace("Unknown", "GeIL").split()[0] if (m.get("m") or "") else "—"
             cap = int(m.get("cap") or 0) / (1 << 30)
-            L.append(f"<div style='margin:0 0 1px 46px;'>{mn} {m.get('pn') or ''} "
-                     f"DDR4/{m.get('clk') or m.get('spd') or '—'} {cap:.0f}GB</div>")
-        L.append(f"<div style='margin:2px 0 2px 0;'>{Y}图形显示{E} {g('gpures') or '—'}\"　"
-                 f"{g('gpuref') or '—'}Hz　DPI: {dpi}</div>")
-        gpu_badge = (" <span style='color:#b8860b;font-weight:bold;'>"
-                     "⚠ 型号未识别·估算可能偏差，建议校准</span>"
+            L.append(f"<div style='{SUB}margin-bottom:1px;'>{mn} {cap:.0f}GB "
+                     f"DDR4/{m.get('clk') or m.get('spd') or '—'}</div>")
+        gpu_badge = (" <span style='color:#b8860b;font-weight:bold;'>⚠ 未识别</span>"
                      ) if getattr(self.model, "gpu_conf", "high") == "low" else ""
-        L.append(f"<div style='margin:0 0 8px 46px;'>{g('gpuname') or self.hw.gpu_name}　"
-                 f"{vram_txt}　{self._temp_html(gpu_t, 65, 78)}{gpu_badge}</div>")
+        L.append(f"<div style='margin:4px 0 1px;'>{Y}显卡{E} "
+                 f"{self._short_model(g('gpuname') or self.hw.gpu_name)} · {vram_txt} · "
+                 f"{self._temp_html(gpu_t, 65, 78)}{gpu_badge}</div>")
+        L.append(f"<div style='{SUB}margin-bottom:6px;'>{g('gpures') or '—'}\"　"
+                 f"{g('gpuref') or '—'}Hz</div>")
         dtemps = dyn.get("disk_temps") or {}
         for i, dk in enumerate(g('disks') or []):
             media = (dk.get("media") or "").upper()
             tag = "SSD" if "SSD" in media else ("HDD" if "HDD" in media else (dk.get("bus") or ""))
             dt = dtemps.get(dk.get("model") or "")
-            L.append(f"<div style='margin-bottom:1px;'>{Y}磁盘信息{E} {i}: {dk.get('model') or '—'} "
-                     f"[{tag}]　{dk.get('letters') or ''}　{dk.get('sizeGB') or '—'}GB　"
+            L.append(f"<div style='margin-bottom:1px;'>{Y}磁盘{i}{E} "
+                     f"{self._short_model(dk.get('model'), 16)} [{tag}] "
+                     f"{dk.get('sizeGB') or '—'}GB {dk.get('letters') or ''} "
                      f"{self._temp_html(dt, 45, 55)}</div>")
         nic = g('nic')
         if nic:
-            L.append(f"<div style='margin:2px 0 1px;'>{Y}网络连接{E} {nic}</div>")
-            L.append(f"<div style='margin:0 0 1px 46px;'>MAC: {g('mac') or '—'}　速率: 1Gbps</div>")
-            L.append(f"<div style='margin:0 0 1px 46px;'>IP: {g('ip') or '—'} 以太网</div>")
-            L.append(f"<div style='margin:0 0 6px 46px;'>网关: {g('gw') or '—'}</div>")
-        dn = dyn.get("down_kbs"); upk = dyn.get("up_kbs")
-        L.append(f"<div style='margin-top:2px;'>{Y}网络速率{E} ↓: "
-                 f"<span style='color:#5aa832'>{dn:.1f} K/s</span>　↑: "
-                 f"<span style='color:#5aa832'>{upk:.1f} K/s</span></div>" if dn is not None and upk is not None
-                 else f"<div style='margin-top:2px;'>{Y}网络速率{E} ↓: —　↑: —</div>")
+            dn = dyn.get("down_kbs"); upk = dyn.get("up_kbs")
+            speed = (f"↓{dn:.1f} K/s ↑{upk:.1f} K/s"
+                     if dn is not None and upk is not None else "↓— ↑—")
+            L.append(f"<div style='margin:4px 0 1px;'>{Y}网　络{E} {self._short_model(nic, 22)}</div>")
+            L.append(f"<div style='{SUB}'>IP {g('ip') or '—'} · {speed}</div>")
         return "".join(L)
 
     def _update_sysinfo(self):
@@ -1614,25 +1620,26 @@ class MainWindow(QMainWindow):
         disp_on = bool(getattr(self, "display_on", True))
         _mon = float(getattr(self.model, "components", {}).get("显示器", 0.0) or 0.0)
         if not disp_on:
-            disp_note = (f" · 显示器已关（省 {_mon:.0f}W，"
-                         f"累计省 {self._disp_saved_wh/1000.0:.3f} 度）")
+            disp_note = (f" · 显示器关 −{_mon:.0f}W"
+                         f" · 累计省 {self._disp_saved_wh/1000.0:.3f} 度")
         elif _mon > 0:
             # v18.13 开屏也把状态写明：用户分不清「读到的数是开屏还是关屏」，
             # 只标注关屏的话，开屏时那行看不出显示器到底计没计进去。
-            disp_note = f" · 显示器开（计 {_mon:.0f}W）"
+            disp_note = f" · 显示器 +{_mon:.0f}W"
         # v18.11：填了额定功率就用 80 PLUS 曲线算出的实时效率，否则用固定效率
         _eff_live = self.cur.get("psu_eff")
         if not _eff_live:
             _eff_live = self.model.psu_efficiency
-        _eff_note = "（动态）" if float(getattr(self, "psu_rating_w", 0.0) or 0.0) > 0 else ""
+        _eff_note = " 动态" if float(getattr(self, "psu_rating_w", 0.0) or 0.0) > 0 else ""
         # v18.13 修正标签：self.cur['sys'] 是直流功耗（不含电源损耗），
         # 含损耗的是上面的大数字 wall。旧文案把这行标成「含电源损耗」，
         # 于是「大数字 220W / 这行 190W」看起来像是开关屏数值反了。
+        # v18.32 精简文案：旧版「直流 X W + 电源损耗 Y W = 插座 Z W（效率 E（动态））」
+        # 嵌套括号+整行过长不美观，改为单行短句、中点分隔。
         _loss = max(0.0, float(self.cur["wall"]) - float(self.cur["sys"]))
         self.wall_sub.setText(
-            f"直流 {self.cur['sys']:.1f} W + 电源损耗 {_loss:.1f} W "
-            f"= 插座 {self.cur['wall']:.1f} W"
-            f"（效率 {_eff_live:.2f}{_eff_note}{calib_note}）{disp_note}")
+            f"插座 {self.cur['wall']:.1f} W ＝ 直流 {self.cur['sys']:.1f} + 损耗 {_loss:.1f}"
+            f" · 效率 {_eff_live:.2f}{_eff_note}{calib_note}{disp_note}")
         kwh = self.energy_wh / 1000.0
         self.energy_big.setText(f"{kwh:.3f} kWh")
         self.cost_sub.setText(f"电费 ¥{self._current_cost():.2f}"
@@ -1672,27 +1679,12 @@ class MainWindow(QMainWindow):
         # v18 系统信息侧栏
         self._update_sysinfo()
 
-        # 月度预算进度 + 超阈值预警
+        # 月度预算预警（v18.32 起主界面不再显示预算卡片，仅保留预警通知；
+        # 预算在设置面板配置，进度见导出报告）
         if self.budget_kwh > 0 or self.budget_cost > 0:
             pct_k = (kwh_month / self.budget_kwh * 100.0) if self.budget_kwh > 0 else 0.0
             pct_c = (month_cost / self.budget_cost * 100.0) if self.budget_cost > 0 else 0.0
             pct = max(pct_k, pct_c)
-            self.budget_bar.setValue(min(100, int(pct + 0.5)))
-            self.budget_big.setText(f"{pct:.0f}%")
-            if self.budget_cost > 0 and self.budget_kwh > 0:
-                sub = (f"电费¥{month_cost:,.0f}/{self.budget_cost:.0f} · "
-                       f"电量{kwh_month:.0f}/{self.budget_kwh:.0f}kWh")
-            elif self.budget_cost > 0:
-                sub = f"电费¥{month_cost:,.0f}/{self.budget_cost:.0f} · 剩¥{max(0.0, self.budget_cost - month_cost):,.0f}"
-            else:
-                sub = f"电量{kwh_month:.0f}/{self.budget_kwh:.0f}kWh"
-            self.budget_sub.setText(sub)
-            col = "#2fae6b" if pct < 80 else ("#ff9f1c" if pct < 100 else "#ff5b6e")
-            if col != self._budget_col:
-                self._budget_col = col
-                self.budget_bar.setStyleSheet(
-                    "QProgressBar{border:none;border-radius:5px;background:#eef1f7;}"
-                    f"QProgressBar::chunk{{background:{col};border-radius:5px;}}")
             # 预警：达到设定比例且未已提醒则弹通知，低于则复位（单次越限只提示一次）
             if self.budget_alert_enabled and pct >= self.budget_alert_pct and not self._budget_alert_active:
                 self._budget_alert_active = True
@@ -1701,9 +1693,6 @@ class MainWindow(QMainWindow):
             elif pct < self.budget_alert_pct:
                 self._budget_alert_active = False
         else:
-            self.budget_big.setText("未设")
-            self.budget_bar.setValue(0)
-            self.budget_sub.setText("设置里可设月度预算")
             self._budget_alert_active = False
 
         # 待机占比
@@ -2499,18 +2488,15 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
                     _mbd = " · ".join(_ps) + " W"
             mini_block = (
                 f"<div class='card'><div class='k'>迷你悬浮窗（导出瞬间快照）</div>"
-                f"<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
-                f"<tr><td>第一行 · 瞬时插座功耗</td><td style='text-align:right'>{_mw}</td></tr>"
-                f"<tr><td>第二行 · 监测状态</td><td style='text-align:right'>{_ms} · 显示器{_disp}</td></tr>"
-                f"<tr><td>第三行 · 本轮累计</td><td style='text-align:right'>{_mc}</td></tr>"
-                f"<tr><td>第四行 · 功耗构成</td><td style='text-align:right'>{_mbd}</td></tr>"
-                f"<tr><td>插座 / 直流系统功耗</td><td style='text-align:right'>{_wall:.1f} W / {_sys:.1f} W</td></tr>"
-                f"<tr><td>电源效率</td><td style='text-align:right'>{_eff:.2f} {_dyn}</td></tr>"
-                f"<tr><td>显示器功耗 / 累计节省</td>"
-                f"<td style='text-align:right'>{_mon:.0f} W / {self._disp_saved_wh/1000.0:.3f} kWh</td></tr>"
-                f"<tr><td>窗口位置 / 显示方式</td>"
-                f"<td style='text-align:right'>{_pos} · {_dock} · {_vis}</td></tr>"
-                f"</table></div>")
+                f"<div style='font-size:12px;line-height:1.7;margin-top:3px;'>"
+                f"瞬时插座功耗：{_mw}<br>"
+                f"状态：{_ms} · 显示器{_disp} · {_dock} · {_vis}<br>"
+                f"本轮累计：{_mc}<br>"
+                f"插座/直流：{_wall:.1f} W / {_sys:.1f} W · 效率 {_eff:.2f}{_dyn} · "
+                f"显示器 {_mon:.0f} W（已省 {self._disp_saved_wh/1000.0:.3f} kWh）<br>"
+                f"构成：{_mbd or '—'}<br>"
+                f"窗口位置：{_pos}"
+                f"</div></div>")
         except Exception:
             mini_block = ""
         avg_w = (self.energy_wh / elapsed_h) if (elapsed_h > 0.001 and self.energy_wh > 0) else (self.cur["wall"] or 0.0)
@@ -2526,85 +2512,158 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
         bars = self._report_hourly_bars()
         bd = self.cur.get("breakdown", {})
         bd_rows = "".join(f"<tr><td>{k}</td><td style='text-align:right'>{v:.1f} W</td></tr>" for k, v in bd.items())
+        # v18.32 横屏版式：QTextDocument **不支持 flex / column-count**（实测 4 个 flex
+        # 子项 x 全为 4、y 递增，即被当作块级竖排），因此横向分栏只能用 table 实现。
+        # 结构：标题行 → 4 格 KPI 一行 → 降级提示 → 主体三栏 → 双列柱图 → 脚注。
         return f"""
 <html><head><meta charset="utf-8"><style>
-body{{font-family:'Microsoft YaHei',sans-serif;background:#f4f6f9;color:#1f2a44;margin:0;padding:12px;}}
-.h{{font-size:18px;font-weight:700;}} .card{{background:#fff;border-radius:9px;padding:11px;margin:8px 0;
-border:1px solid #e6e9ef;}} .k{{color:#8a93a6;font-size:11px;}} .v{{font-size:24px;font-weight:700;}}
-.grid{{display:flex;gap:8px;flex-wrap:wrap;}} .box{{flex:1;min-width:120px;background:#fff;border-radius:9px;
-padding:10px;border:1px solid #e6e9ef;}} table{{width:100%;border-collapse:collapse;font-size:12px;}}
-td{{padding:3px 4px;border-bottom:1px solid #eef1f7;}}
+body{{font-family:'Microsoft YaHei',sans-serif;background:#f4f6f9;color:#1f2a44;margin:0;padding:10px;}}
+.h{{font-size:18px;font-weight:700;}}
+.card{{background:#fff;border-radius:9px;padding:8px 10px;margin:0 0 7px 0;border:1px solid #e6e9ef;}}
+.box{{background:#fff;border-radius:9px;padding:7px 10px;border:1px solid #e6e9ef;}}
+.k{{color:#8a93a6;font-size:11px;}} .v{{font-size:21px;font-weight:700;}}
+table{{width:100%;border-collapse:collapse;font-size:12px;}}
+td{{padding:2px 4px;border-bottom:1px solid #eef1f7;}}
+.nt{{border:0;}} .nt td{{border:0;vertical-align:top;}}
 </style></head><body>
-<div class="h">PC 用电电费 · 24 小时汇总</div>
-<div class="k">生成时间：{now}</div>
-<div class="grid">
-  <div class="box"><div class="k">累计电量</div><div class="v">{kwh:.3f} kWh</div></div>
-  <div class="box"><div class="k">电费（{self.rate:.2f} 元/度）</div><div class="v">¥{cost:.2f}</div></div>
-  <div class="box"><div class="k">平均插座功耗</div><div class="v">{avg_w:.0f} W</div></div>
-  <div class="box"><div class="k">峰值插座功耗</div><div class="v">{self.peak_wall:.0f} W</div></div>
-</div>
+<table class="nt"><tr>
+  <td style="width:70%;"><div class="h">PC 用电电费 · 24 小时汇总</div></td>
+  <td style="width:30%;text-align:right;"><div class="k">生成时间：{now}</div></td>
+</tr></table>
+<table class="nt"><tr>
+  <td style="width:25%;padding-right:3px;"><div class="box"><div class="k">累计电量</div>
+    <div class="v">{kwh:.3f} kWh</div></div></td>
+  <td style="width:25%;padding:0 3px;"><div class="box"><div class="k">电费（{self.rate:.2f} 元/度）</div>
+    <div class="v">¥{cost:.2f}</div></div></td>
+  <td style="width:25%;padding:0 3px;"><div class="box"><div class="k">平均插座功耗</div>
+    <div class="v">{avg_w:.0f} W</div></div></td>
+  <td style="width:25%;padding-left:3px;"><div class="box"><div class="k">峰值插座功耗</div>
+    <div class="v">{self.peak_wall:.0f} W</div></div></td>
+</tr></table>
+<div style="height:7px;"></div>
 {degraded_block}
-<div class="card"><div class="k">本机配置</div>
-  <div style="font-size:14px;line-height:1.7;margin-top:6px;">
-  CPU：{self.hw.cpu_name}（{self.hw.cpu_cores}C/{self.hw.cpu_threads}T）<br>
-  GPU：{self.hw.gpu_name}{(' · 真实功耗' if self.hw.gpu_is_nvidia else ' · 估算')}<br>
-  内存：{self.hw.ram_bytes/1e9:.1f} GB · 存储：{', '.join(f'{t} {s:.0f}G' for t,s in self.hw.disks)}<br>
-  显示器：{self.hw.monitor_count} 台 · 系统：{self.hw.os_caption}
-  </div></div>
-<div class="card"><div class="k">功耗构成（当前估算）</div>
-  <table>{bd_rows}</table></div>
-{mini_block}
-<div class="card"><div class="k">逐小时平均功耗</div>{bars}</div>
-{pblock}
-{proj}
-{idle_block}
-{apps_block}
-<div class="k" style="margin-top:10px;">注：台式机无墙插电表，GPU（N 卡）采用 nvidia-smi 真实读数，
+<table class="nt"><tr>
+  <td style="width:34%;padding-right:4px;">
+    <div class="card"><div class="k">本机配置</div>
+      <div style="font-size:12px;line-height:1.65;margin-top:3px;">
+      CPU：{self.hw.cpu_name}（{self.hw.cpu_cores}C/{self.hw.cpu_threads}T）<br>
+      GPU：{self.hw.gpu_name}{(' · 真实功耗' if self.hw.gpu_is_nvidia else ' · 估算')}<br>
+      内存：{self.hw.ram_bytes/1e9:.1f} GB · 存储：{', '.join(f'{t} {s:.0f}G' for t,s in self.hw.disks)}<br>
+      显示器：{self.hw.monitor_count} 台 · 系统：{self.hw.os_caption}
+      </div></div>
+    <div class="card"><div class="k">功耗构成（当前估算）</div>
+      <table>{bd_rows}</table></div>
+    {pblock}
+  </td>
+  <td style="width:33%;padding:0 4px;">
+    {proj}
+    {idle_block}
+    {apps_block}
+  </td>
+  <td style="width:33%;padding-left:4px;">
+    <div class="card"><div class="k">逐小时平均功耗</div>{bars}</div>
+    {mini_block}
+  </td>
+</tr></table>
+<div class="k" style="margin-top:4px;">注：台式机无墙插电表，GPU（N 卡）采用 nvidia-smi 真实读数，
 CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_note}</div>
 </body></html>"""
 
     def _report_hourly_bars(self) -> str:
-        """v18.29+ W4：从 _build_report_html 抽出的逐小时平均功耗柱图 HTML。"""
-        keys = sorted(self.hourly.keys())
-        bars = ""
-        if keys:
-            maxv = max((self.hourly[k][0] / self.hourly[k][1]) for k in keys if self.hourly[k][1])
-            for k in keys:
-                s, n = self.hourly[k]
-                avg = s / n if n else 0
-                pct = (avg / maxv * 100) if maxv else 0
-                bars += (f"<div style='margin:2px 0;'><div style='font-size:10px;color:#555;'>{k} "
-                         f"· {avg:.0f}W</div><div style='background:#eef1f7;border-radius:2px;'>"
-                         f"<div style='width:{pct:.0f}%;background:#2f6bff;height:8px;border-radius:2px;'></div></div></div>")
-        return bars
+        """v18.29+ W4：从 _build_report_html 抽出的逐小时平均功耗柱图 HTML。
 
-    def _render_png(self, html: str, path: str, width: int = 960, scale: float = 2.0) -> bool:
+        v18.32：改为**双列**排布。QTextDocument 不支持 flex/多栏，24 行柱图单列会
+        让报告高度翻倍成为竖长条；拆成两列后高度减半，配合三栏主体可得到横屏比例。
+        """
+        keys = sorted(self.hourly.keys())
+        if not keys:
+            return ""
+        vals = [self.hourly[k][0] / self.hourly[k][1] for k in keys if self.hourly[k][1]]
+        maxv = max(vals) if vals else 1.0     # 全 0 采样时避免 max() 空序列抛错
+
+        def _bar(k):
+            s, n = self.hourly[k]
+            avg = s / n if n else 0.0
+            pct = (avg / maxv * 100) if maxv else 0.0
+            # v18.32：柱条用 HTML 属性 width+bgcolor 的嵌套 table 实现。
+            # 实测 QTextDocument 里三层写法只有这层可靠——CSS width/background
+            # 在嵌套 table 中不生效（条形不渲染），HTML 属性则正常。
+            bar_row = ("<table width='100%' border='0' cellspacing='0' cellpadding='0'><tr>"
+                       f"<td width='{pct:.0f}%' bgcolor='#2f6bff' "
+                       "style='font-size:7px;padding:0;'>&nbsp;</td>"
+                       "<td bgcolor='#eef1f7' style='font-size:7px;padding:0;'>&nbsp;</td>"
+                       "</tr></table>")
+            return (f"<div style='margin:1px 0;'>"
+                    f"<div style='font-size:9px;color:#555;'>{k} · {avg:.0f}W</div>{bar_row}</div>")
+
+        half = (len(keys) + 1) // 2
+        left = "".join(_bar(k) for k in keys[:half])
+        right = "".join(_bar(k) for k in keys[half:])
+        return (f"<table class='nt'><tr>"
+                f"<td style='width:50%;padding-right:6px;'>{left}</td>"
+                f"<td style='width:50%;padding-left:6px;'>{right}</td></tr></table>")
+
+    # v18.32 横屏版式参数（笔记本/显示器都是横屏，报告图片也应为横版）
+    REPORT_WIDTH = 1600        # 逻辑宽度起点（px）
+    REPORT_WIDTH_MIN = 1100    # 收窄下限（内容很少时别压太窄）
+    REPORT_WIDTH_MAX = 2400    # 加宽上限（再宽字就太小了）
+    REPORT_RATIO = 1.70        # 目标 宽/高，接近 16:9(1.78)，留一点余量
+    REPORT_OUT_PX = 3000       # 输出图片宽度上限（像素），scale 据此反推
+
+    def _render_png(self, html: str, path: str, width: int = 0, scale: float = 0.0) -> bool:
         """把报告 HTML 渲染成 PNG 图片；成功返回 True，不弹任何对话框。
 
         沿用 QTextDocument 引擎（与旧版 _render_pdf 同一套 HTML 解析），只是输出
-        目标从 QPrinter(PdfFormat) 换成 QImage——因此版式与旧 PDF 完全一致，但得到
-        一张可直接贴图 / 分享的图片。纯 Qt，完全离线，也不会让 exe 膨胀。
+        目标从 QPrinter(PdfFormat) 换成 QImage——纯 Qt，完全离线，也不让 exe 膨胀。
 
-        width 从 860 提到 960、CSS 间距收紧，用于解决报告 PNG 高度过长的问题。
+        v18.32 横屏自适应
+        -----------------
+        旧版固定 width=960，而报告内部用 display:flex 分栏——但 **QTextDocument 不支持
+        flex**（实测 4 个 flex 子项的 x 全为 4、y 逐行递增，即退化成块级竖排），
+        结果产出 960×1476 的竖长条（0.65:1），横屏上要一路滚动才能看完。
+        本版改为：① 报告 HTML 用 table 分栏（QTextDocument 唯一可靠的横排方案）；
+        ② 逻辑宽度不再固定，而是迭代搜索到让 宽/高 ≈ REPORT_RATIO 的值——
+        加宽则换行变少、高度下降，单调收敛，7 次内必停；
+        ③ scale 由输出宽度上限反推，保证不同内容量下图片像素宽度都在 3000 左右。
 
-        width 为报告逻辑宽度（px），scale 为超采样倍数（2 => 视网膜级清晰度）。
+        width / scale 传 0（默认）即走自适应；显式传值则按调用方指定渲染。
         """
         try:
             from PySide6.QtGui import QPainter, QImage, QColor
             doc = QTextDocument()
             doc.setDefaultFont(QFont("Microsoft YaHei", 10))
             doc.setHtml(html)
-            doc.setTextWidth(width)
+
+            w = int(width) if width else self.REPORT_WIDTH
+            for _ in range(7):
+                doc.setTextWidth(w)
+                hh = float(doc.size().height())
+                if hh <= 0:
+                    break
+                ratio = w / hh
+                if self.REPORT_RATIO * 0.95 <= ratio <= self.REPORT_RATIO * 1.05:
+                    break
+                # 太竖 -> 加宽（换行变少、高度下降）；太扁 -> 收窄（高度上升）
+                step = int(w * 0.10) if ratio < self.REPORT_RATIO else -int(w * 0.10)
+                nw = max(self.REPORT_WIDTH_MIN, min(self.REPORT_WIDTH_MAX, w + step))
+                if nw == w:      # 已到边界，停止
+                    break
+                w = nw
+
+            doc.setTextWidth(w)
             size = doc.size()
             w, h = int(size.width()), int(size.height())
             if w <= 0 or h <= 0:
                 return False
-            img = QImage(int(w * scale), int(h * scale), QImage.Format_ARGB32)
+            s = float(scale) if scale else min(2.0, self.REPORT_OUT_PX / float(w))
+            if s <= 0:
+                s = 2.0
+            img = QImage(int(w * s), int(h * s), QImage.Format_ARGB32)
             img.fill(QColor("#f4f6f9"))      # 与报告 body 底色一致
             painter = QPainter(img)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-            painter.scale(scale, scale)
+            painter.scale(s, s)
             doc.drawContents(painter)
             painter.end()
             return img.save(path, "PNG")
@@ -3128,6 +3187,129 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 continue
             a = agg.setdefault(hh, [0.0, 0]); a[0] += sw; a[1] += n
         return {h: (agg[h][0] / agg[h][1] if agg[h][1] else 0.0) for h in sorted(agg)}
+
+    def open_chart_detail(self):
+        """v18.32：主界面功耗曲线双击进入的大图详情。
+
+        · 完整重画近 60 分钟曲线（数据源 _chart_pts，与主图同一份镜像）；
+        · 支持鼠标框选放大（rubber band）、双击复位；
+        · 顶部给当前/平均/峰值统计，底部附操作提示。
+        """
+        d = QDialog(self); d.setWindowTitle("功耗曲线详情（近 60 分钟）"); d.setStyleSheet(CSS)
+        d.resize(1020, 600)
+        vl = QVBoxLayout(d); vl.setContentsMargins(16, 14, 16, 14); vl.setSpacing(10)
+
+        pts = list(getattr(self, "_chart_pts", None) or [])
+        if len(pts) < 2:
+            tip = QLabel("暂无曲线数据。开始监测后每 2 秒记录一个采样点，"
+                         "稍后再双击曲线即可查看详情。")
+            tip.setWordWrap(True); tip.setStyleSheet("font-size:13px;color:#6b7488;")
+            vl.addWidget(tip)
+            ok = QPushButton("关闭"); ok.clicked.connect(d.accept); vl.addWidget(ok)
+            d.exec(); return
+
+        # 统计摘要
+        walls = [wv for _ts, wv in pts if wv > 0]
+        now_w = pts[-1][1]
+        avg_w = (sum(walls) / len(walls)) if walls else 0.0
+        pk_ts, pk_w = max(pts, key=lambda p: p[1])
+        pk_str = QDateTime.fromMSecsSinceEpoch(int(pk_ts)).toString("HH:mm:ss")
+        span_min = (pts[-1][0] - pts[0][0]) / 60000.0
+        head = QLabel(f"当前 <b>{now_w:.0f} W</b> · 平均 <b>{avg_w:.0f} W</b> · "
+                      f"峰值 <b>{pk_w:.0f} W</b>（{pk_str}） · "
+                      f"共 {len(pts)} 个采样点，覆盖约 {span_min:.0f} 分钟")
+        head.setStyleSheet("font-size:13px;color:#2b3552;")
+        vl.addWidget(head)
+
+        series = QLineSeries()
+        series.setColor(QColor("#2f6bff"))
+        # x 用毫秒时间戳（float）：与主图 _chart_card 相同做法——QDateTimeAxis 接受
+        # 毫秒 x 值；QXYSeries.append 不接受 (QDateTime, float) 重载，只能传数值。
+        for ts, wv in pts:
+            series.append(float(ts), float(wv))
+        chart = QChart()
+        chart.addSeries(series)
+        chart.legend().hide()
+        chart.setBackgroundVisible(False)
+        ax_x = QDateTimeAxis(); ax_x.setFormat("HH:mm:ss")
+        ax_y = QValueAxis(); ax_y.setTitleText("插座功耗 W")
+        vals = [wv for _t, wv in pts]
+        y_lo = 0.0
+        y_hi = max(max(vals) * 1.15, 50.0)
+        ax_x.setRange(QDateTime.fromMSecsSinceEpoch(int(pts[0][0])),
+                      QDateTime.fromMSecsSinceEpoch(int(pts[-1][0])))
+        ax_y.setRange(y_lo, y_hi)
+        ax_y.setLabelFormat("%.0f")
+        chart.addAxis(ax_x, Qt.AlignmentFlag.AlignBottom)
+        chart.addAxis(ax_y, Qt.AlignmentFlag.AlignLeft)
+        series.attachAxis(ax_x); series.attachAxis(ax_y)
+
+        view = ChartView(chart)          # 未给回调 -> 双击复位缩放
+        view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        view.setRubberBand(QChartView.RubberBand.RectangleRubberBand)
+        view.setMinimumHeight(420)
+        vl.addWidget(view, 1)
+
+        # 刷新率切换（v18.32）：详情内可改全局采样间隔，经 worker.set_interval
+        # 线程安全生效（下一拍应用，不跨线程重启定时器），并随会话落盘。
+        rate_row = QHBoxLayout()
+        rate_lbl = QLabel("刷新率")
+        cb_rate = QComboBox()
+        for ms, label in ((1000, "1 秒"), (2000, "2 秒"), (3000, "3 秒"),
+                          (5000, "5 秒"), (10000, "10 秒")):
+            cb_rate.addItem(label, ms)
+        _idx = cb_rate.findData(int(getattr(self, "sample_ms", SAMPLE_MS)))
+        cb_rate.setCurrentIndex(max(0, _idx))
+        rate_note = QLabel()
+        rate_note.setStyleSheet("font-size:12px;color:#8a93a6;")
+
+        def _on_rate(i):
+            ms = int(cb_rate.itemData(i))
+            self.sample_ms = ms
+            wk = getattr(self, "worker", None)
+            if wk is not None:
+                wk.set_interval(ms)
+            rate_note.setText(f"已切换为 {ms/1000:.0f} 秒/拍，主界面与详情同步生效")
+            try:
+                self._save_session()
+            except Exception:
+                pass
+
+        cb_rate.currentIndexChanged.connect(_on_rate)
+        rate_row.addWidget(rate_lbl)
+        rate_row.addWidget(cb_rate)
+        rate_row.addWidget(rate_note, 1)
+        vl.addLayout(rate_row)
+
+        # 详情曲线实时跟进：每秒把 _chart_pts 中新增的采样点追加到大图上并平移 x 轴，
+        # 弹窗不再是打开瞬间的静态快照。timer 挂在 d 上，弹窗销毁即回收。
+        sync_state = {"last": pts[-1][0]}
+        sync_timer = QTimer(d)
+        sync_timer.setInterval(1000)
+
+        def _sync_new_points():
+            try:
+                added = False
+                for ts, wv in (getattr(self, "_chart_pts", None) or []):
+                    if ts > sync_state["last"]:
+                        series.append(float(ts), float(wv))
+                        sync_state["last"] = ts
+                        added = True
+                if added:
+                    latest = (getattr(self, "_chart_pts", None) or [])
+                    if latest:
+                        ax_x.setMax(QDateTime.fromMSecsSinceEpoch(int(latest[-1][0])))
+            except Exception:
+                pass      # 已知：弹窗关闭竞态下 self 状态可能变化，静默忽略即可
+
+        sync_timer.timeout.connect(_sync_new_points)
+        sync_timer.start()
+
+        hint = QLabel("鼠标左键框选可放大局部 · 双击曲线复位缩放 · 曲线实时跟进新采样点")
+        hint.setStyleSheet("font-size:12px;color:#8a93a6;")
+        vl.addWidget(hint)
+        ok = QPushButton("关闭"); ok.clicked.connect(d.accept); vl.addWidget(ok)
+        d.exec()
 
     def open_hourly(self):
         """用电时段分布：按一天 0–23 时展示平均插座功耗，柱按峰谷时段着色，定位高耗时段。"""

@@ -244,19 +244,17 @@ w.budget_alert_enabled = True
 w.budget_alert_pct = 90.0
 w.budget_cost = 20.0                  # 预算¥20，预计¥22.4 -> 超 90% 触发
 w._refresh_readout()
-print("budget pct =", w.budget_big.text(), "| bar =", w.budget_bar.value(), "| sub =", w.budget_sub.text())
+# v18.32 主界面已移除「月度预算」卡片（budget_big/bar/sub 不复存在），
+# 但预警通知逻辑保留：超 90% 应触发 _budget_alert_active
 assert w._budget_alert_active is True, "应触发预算预警"
-assert w.budget_bar.value() > 90
 # 调高预算后 pct<90 应复位
 w.budget_cost = 1000.0
 w._refresh_readout()
 assert w._budget_alert_active is False, "pct<阈值 应复位"
-print("budget reset OK, pct =", w.budget_big.text())
-# 未设预算显示「未设」
+# 未设预算：预警状态复位即可（无 UI 断言）
 w.budget_cost = 0.0; w.budget_kwh = 0.0
 w._refresh_readout()
-assert w.budget_big.text() == "未设"
-print("budget unset OK")
+print("budget alert trigger/reset/unset OK")
 
 # 待机占比统计（空闲帧 vs 活跃帧分类累加）
 w.energy_wh = 0.0; w.idle_energy_wh = 0.0; w.active_energy_wh = 0.0
@@ -384,12 +382,23 @@ assert not w._settings_dock.isVisible()
 print("settings panel OK (dock expand/save/sync)")
 
 # v18 回归2：系统信息侧栏（AIDA64 风格）渲染
+w._sys_static = {"os": "Microsoft Windows 10 家庭版", "osarch": "64位", "fw": "UEFI",
+                 "sb": 1, "mb": "JGINYUE B450M-PLUS", "cpu": w.hw.cpu_name,
+                 "cores": 6, "threads": 12, "mhz": 3700, "l1": 384, "l2": 2048, "l3": 32768,
+                 "gpuname": w.hw.gpu_name, "gpuvram": 8589934592, "gpures": "2560", "gpuref": "119",
+                 "disks": [{"model": "ST1000LM035-1RK174", "media": "HDD", "letters": "D:",
+                            "sizeGB": 932},
+                           {"model": "HS-SSD-C2000L", "media": "SSD", "letters": "C:",
+                            "sizeGB": 256}],
+                 "nic": "Realtek PCIe GbE Family Controller", "ip": "192.168.1.12"}
 w._sys_dyn = {"ram_total": 34359738368, "ram_used": 17179869184, "ram_pct": 50.0,
               "mhz": 3700, "boot": time.time() - 3661, "down_kbs": 1.5, "up_kbs": 0.5,
               "cpu_temp": 45.0, "gpu_temp": 41.0}
 w._update_sysinfo()
 _html = w.sysinfo_view.toHtml()
-for key in ("运行时间", "操作系统", "处 理 器", "物理内存", "图形显示", "磁盘信息", "网络"):
+# 注意：不要断言 '网　络' 标签本身——全角空格会被 toHtml() 转成 &#160;，匹配不到；
+# 用网络块的稳定内容（IP 行）代替。
+for key in ("运行时间", "操作系统", "处 理 器", "物理内存", "显卡", "磁盘0", "192.168.1.12"):
     assert key in _html, key
 print("sysinfo panel OK")
 
@@ -689,12 +698,12 @@ w.cur = {"cpu_load": 40.0, "gpu_power": 47.0, "gpu_valid": True,
          "breakdown": _est["breakdown"], "display_on": True,
          "psu_eff": _est["psu_eff"]}
 w._refresh_readout()
-assert "（动态）" in w.wall_sub.text(), w.wall_sub.text()
+assert "动态" in w.wall_sub.text(), w.wall_sub.text()
 assert ("%.2f" % w.cur["psu_eff"]) in w.wall_sub.text(), w.wall_sub.text()
 _txt_dyn = w.wall_sub.text()
 w.psu_rating_w = 0.0; w.model.psu_rating_w = 0.0
 w._refresh_readout()
-assert "（动态）" not in w.wall_sub.text(), w.wall_sub.text()
+assert "动态" not in w.wall_sub.text(), w.wall_sub.text()
 print("readout dynamic-eff badge OK\n  动态:", _txt_dyn, "\n  固定:", w.wall_sub.text())
 
 # v18.13 读数行标签：直流 / 损耗 / 插座 三个数必须自洽，且与 cur 一致
@@ -709,17 +718,18 @@ for _don in (True, False):
     w.display_on = _don
     w._refresh_readout()
     _t = w.wall_sub.text()
-    _dc = float(_t.split("直流 ")[1].split(" W")[0])
-    _ls = float(_t.split("电源损耗 ")[1].split(" W")[0])
+    # v18.32 新文案：'插座 X W ＝ 直流 Y + 损耗 Z · 效率 E'
+    _dc = float(_t.split("直流 ")[1].split(" +")[0])
+    _ls = float(_t.split("损耗 ")[1].split(" ·")[0])
     _so = float(_t.split("插座 ")[1].split(" W")[0])
     assert abs(_dc - w.cur["sys"]) < 0.05, (_t, w.cur["sys"])
     assert abs(_so - w.cur["wall"]) < 0.05, (_t, w.cur["wall"])
     assert abs((_dc + _ls) - _so) < 0.05, "直流 + 损耗 必须等于插座: " + _t
     assert _ls > 0, "含电源损耗时损耗必须为正: " + _t
     if _don:
-        assert "显示器开" in _t, "开屏应显式标注状态: " + _t
+        assert "显示器 +" in _t, "开屏应显式标注状态: " + _t
     else:
-        assert "显示器已关" in _t, "关屏应显式标注状态: " + _t
+        assert "显示器关" in _t, "关屏应显式标注状态: " + _t
     print("  屏幕%s: %s" % ("开" if _don else "关", _t))
 w.display_on = True
 print("readout label OK (直流 + 损耗 = 插座，开关屏状态均标注)")
