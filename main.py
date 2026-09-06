@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.38"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.39"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -2051,6 +2051,10 @@ class MainWindow(QMainWindow):
         elif "内存" in str(name):
             t = st.get("memory")
             warn, hot = self._TEMP_LIMITS["memory"]
+            if t is None and dyn.get("sensor_ready"):
+                # LHM 已连接但本机内存确实无温度探头：单元格直接写明，
+                # 不再留一个像坏掉的「—」（tooltip 另有完整原因说明）。
+                return "无探头", QColor("#9aa3b2")
         elif "主板" in str(name) or "芯片" in str(name):
             t = st.get("motherboard")
             warn, hot = self._TEMP_LIMITS["board"]
