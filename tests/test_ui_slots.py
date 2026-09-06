@@ -102,7 +102,28 @@ def run_slots(names):
             print(f"FAIL  {name}", flush=True)
             traceback.print_exc()
             sys.stdout.flush()
+    _shutdown_window(w)
     return failed
+
+
+def _shutdown_window(w):
+    """停掉采样线程，让解释器能干净退出。
+
+    正常产品行为是"关闭窗口 = 最小化到托盘、监测继续"，closeEvent 会忽略关闭，
+    采样线程本就不该停。测试进程不走托盘路径，必须显式收尾，否则退出码为 127
+    会被 CI 误判成失败（槽函数本身全部通过）。
+    """
+    try:
+        w._force_quit = True
+        w.close()
+        wk = getattr(w, "worker", None)
+        if wk is not None:
+            wk.stop()
+            if wk.isRunning():
+                wk.quit()
+                wk.wait(2000)
+    except Exception:
+        pass
 
 
 def main():

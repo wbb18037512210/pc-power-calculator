@@ -55,3 +55,18 @@ if __name__ == "__main__":
     test_report_shows_banner_when_degraded()
     test_report_no_banner_when_clean()
     print("ALL OK: W3 降级账本测试通过")
+    # 采样线程(SampleWorker)会阻止解释器干净退出——正常产品行为就是"关闭=最小化
+    # 到托盘、监测继续"，线程本就不该停。测试进程必须显式强制退出，否则退出码
+    # 为 127，会让 CI 误判成测试失败（测试内容本身是通过的）。
+    try:
+        w._force_quit = True
+        w.close()
+        _wk = getattr(w, "worker", None)
+        if _wk is not None:
+            _wk.stop()
+            if _wk.isRunning():
+                _wk.quit()
+                _wk.wait(2000)
+    except Exception:
+        pass
+    sys.exit(0)

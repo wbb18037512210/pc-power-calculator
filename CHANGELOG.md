@@ -5,6 +5,40 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.31 — 硬件识别增强（移植 TubaTools 三项能力）
+
+> 参考 `TubaTools`（图吧工具箱）的 `HardwareInfoService` 做逐项对比后，挑出对**功耗估算精度**
+> 真正有影响的三项落地。纯展示向能力（JEDEC 厂商解码、三字母厂商码表、CPU-Z 覆盖）不移植——
+> 后者需外部 exe，与本项目零依赖离线定位不符。
+
+### P0 虚拟/伪显卡过滤（消除灾难性误判）
+- 原过滤只有 `Virtual / Basic / Microsoft` 三个词，**实测漏掉**：
+  `GameViewer Display Adapter`（远控/串流虚拟显卡，本机就装了）、`Idd Desk Adapter`、`DDA Wrapper`。
+- 一旦被当成主显卡，`identify_gpu` 返回 **75W / conf=low**，而本机真实 GTX 1080 是 **180W（−58%）**。
+- 黑名单扩到 9 个关键词，抽为模块级常量 `VIRTUAL_GPU_KEYWORDS` 便于单测。
+
+### P1a 便携机判定改以机箱类型为准
+- 原实现只看 `Win32_Battery` 计数 —— **台式机接 UPS 会误判成笔记本**（UPS 经 USB HID 暴露电池）。
+- 改为 `Win32_SystemEnclosure.ChassisTypes`（8/9/10/11/14/30/31/32）为准，电池仅兜底，
+  并排除 `Virtual/VMware/HVM/KVM/QEMU/XEN/Hyper-V` 等虚拟机型号。新增 `HardwareInfo.is_laptop`。
+
+### P1b 显示器功耗改按 EDID 物理尺寸建模
+- 原逻辑按显卡分辨率三档粗估（1080p 22W / 1440p 30W / 4K 45W），超宽屏、带鱼屏会落到错误档。
+- 新增 `root\WMI WmiMonitorBasicDisplayParams` 采集 EDID 物理宽高(cm)，按 PnP 码与
+  `Win32_PnPEntity(PNPClass=Monitor)` 关联，换算英寸数（本机实测 54×31cm → **24.5 英寸**）。
+- 功耗模型改为「面积 × 0.0181 W/cm² × 分辨率系数」连续估算。单位功耗**标定自
+  24.5" 1440p = 30.0W，与旧常量 `monitor_1440p` 完全一致**，既有估算结果不跳变
+  （本机实测 30.0W → 30.3W，差 +0.3W）。
+- 台数取 `monitor_count` 与 `monitors` 的并集：测到尺寸的按面积精算，测不到的按分辨率档补齐；
+  **取不到 EDID 时完整回退旧逻辑**，行为与 v18.30 及之前完全一致。
+
+### 测试
+- 新增 `tests/test_hw_detect.py`（49 项）：虚拟卡过滤 / 笔记本判定 / 显示器建模 / `build_model` 回归保护。
+- 修复 `test_degraded`、`test_ui_slots` 退出码为 127 的问题：产品行为是"关闭=最小化到托盘、
+  监测继续"，采样线程本就不停，测试进程需显式 `_force_quit` 收尾，否则 CI 会误判失败。
+
+---
+
 ## v18.30 — 修复「历史趋势」点击无反应 + 全局异常可见化
 
 > 现象：点击「历史趋势」按钮毫无反应（无弹窗、无报错）。

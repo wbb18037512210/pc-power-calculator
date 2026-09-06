@@ -22,6 +22,34 @@ except Exception:
     psutil = None
 
 
+# ---------------------------------------------------------------------------
+# v18.31 硬件识别增强（移植自 TubaTools HardwareInfoService）
+# ---------------------------------------------------------------------------
+# 虚拟/伪显卡黑名单。原来只有 Virtual/Basic/Microsoft 三个词，实测会漏掉
+# 「GameViewer Display Adapter」（远控/串流虚拟显卡，国产远控软件常见）和
+# 「Idd Desk Adapter」（间接显示驱动）—— 一旦被当成主显卡，GTX 1080 的 180W
+# 会被算成 75W（-58%）。关键词全部大写比对，调用方负责 casefold。
+VIRTUAL_GPU_KEYWORDS = (
+    "VIRTUAL",          # Virtual Display / Virtual Adapter / Virtual GPU
+    "BASIC",            # Microsoft Basic Render Driver
+    "MICROSOFT",        # 微软系软渲染 / 远程桌面适配器
+    "DDA WRAPPER",      # Discrete Device Assignment（显卡直通）
+    "IDD DESK",         # Indirect Display Driver
+    "GAMEVIEWER",       # 远控串流虚拟显卡（实测本机存在）
+    "HONOR VIRTUAL",
+    "REMOTE DISPLAY",   # RDP / 远程桌面
+    "虚拟",
+)
+
+# Win32_SystemEnclosure.ChassisTypes 中表示便携机的取值
+# 8=Portable 9=Laptop 10=Notebook 11=Handheld 14=SubNotebook
+# 30=Tablet 31=Convertible 32=Detachable
+LAPTOP_CHASSIS_TYPES = frozenset((8, 9, 10, 11, 14, 30, 31, 32))
+
+# 虚拟机型号关键词：有电池也不能当笔记本（云主机/UPS 场景）
+VM_MODEL_KEYWORDS = ("VIRTUAL", "VMWARE", "HVM", "KVM", "QEMU", "XEN", "HYPER-V")
+
+
 @dataclass
 class HardwareInfo:
     cpu_name: str = "未知 CPU"
@@ -35,6 +63,12 @@ class HardwareInfo:
     disks: list = field(default_factory=list)          # [(media_type, size_gb), ...]
     monitor_count: int = 1
     has_battery: bool = False
+    # v18.31：以机箱类型(ChassisTypes)判定的便携机标志，比单看电池可靠
+    # （接 UPS 的台式机 Win32_Battery 也会命中）
+    is_laptop: bool = False
+    # v18.31：每台显示器的 EDID 物理尺寸，[{"label","pnp","w_cm","h_cm","inches"}, ...]
+    # 用于按面积连续估算显示器功耗；取不到 EDID 时为空列表，功耗模型回退到分辨率分档
+    monitors: list = field(default_factory=list)
     gpu_is_nvidia: bool = False
     os_caption: str = ""
     raw: dict = field(default_factory=dict)
@@ -63,6 +97,92 @@ def _ps(script: str, timeout: int = 15) -> Optional[str]:
         return _decode(proc.stdout or b"")
     except Exception:
         return None
+
+
+def _is_virtual_gpu(name: str) -> bool:
+    """判断显示适配器名称是否为虚拟/伪显卡（应被排除，不能当主显卡）。
+
+    原实现只比对 Virtual/Basic/Microsoft 三个词，实测漏掉：
+      · GameViewer Display Adapter —— 远控/串流软件装的虚拟显卡（本机存在）
+      · Idd Desk Adapter          —— Windows 间接显示驱动
+      · DDA Wrapper               —— 显卡直通
+    这些一旦被当成主显卡，identify_gpu 会返回 75W/low，真实 180W 显卡被低估 58%。
+    """
+    up = (name or "").upper()
+    return any(k in up for k in VIRTUAL_GPU_KEYWORDS)
+
+
+def _extract_monitor_pnp(device_id: str) -> str:
+    """从 PnP 设备 ID 提取显示器型号码。
+
+    'DISPLAY\\SGT2450\\5&264d596b&0&UID41222_0' → 'SGT2450'
+    '#'(设备路径分隔符) 先归一化为 '\\'，再取 DISPLAY/MONITOR 的下一段。
+    """
+    parts = (device_id or "").replace("#", "\\").split("\\")
+    parts = [p for p in parts if p]
+    for i, p in enumerate(parts[:-1]):
+        if p.upper() in ("DISPLAY", "MONITOR"):
+            return parts[i + 1]
+    # 兜底：取首个以三个字母开头的段（厂商码格式）
+    for p in parts:
+        if len(p) >= 3 and p[:3].isalpha():
+            return p
+    return ""
+
+
+def _detect_laptop(chassis_types, model: str, has_battery: bool) -> bool:
+    """便携机判定：机箱类型为准，电池仅作兜底，虚拟机一律排除。
+
+    旧实现只看 Win32_Battery 计数 —— 台式机接 UPS 时同样会命中
+    （UPS 经 USB HID 暴露电池，Win32_Battery 能枚举到），于是整机基线功耗
+    按笔记本算，误差可观。ChassisTypes 来自 SMBIOS，是权威的形态依据。
+    """
+    if chassis_types:
+        return any(t in LAPTOP_CHASSIS_TYPES for t in chassis_types)
+    up = (model or "").upper()
+    if any(k in up for k in VM_MODEL_KEYWORDS):
+        return False
+    return bool(has_battery)
+
+
+def _diag_inches(w_cm: float, h_cm: float) -> Optional[float]:
+    """EDID 物理宽高(cm) → 对角线英寸。"""
+    if w_cm > 0 and h_cm > 0:
+        return round(((w_cm ** 2 + h_cm ** 2) ** 0.5) / 2.54, 1)
+    return None
+
+
+def _monitor_edid_sizes() -> dict:
+    """读显示器 EDID 物理尺寸：root\\WMI WmiMonitorBasicDisplayParams。
+
+    返回 {PNP码大写: (宽cm, 高cm)}。物理显示器普遍有值，
+    虚拟机 / 纯远程桌面会话通常为空——此时功耗模型回退到分辨率分档。
+    """
+    out = _ps(
+        "(Get-CimInstance -Namespace root\\WMI -ClassName WmiMonitorBasicDisplayParams | "
+        "Select-Object InstanceName,MaxHorizontalImageSize,MaxVerticalImageSize | ConvertTo-Json)"
+    )
+    sizes: dict = {}
+    if not out:
+        return sizes
+    try:
+        arr = json.loads(out)
+        if isinstance(arr, dict):
+            arr = [arr]
+        for it in arr:
+            pnp = _extract_monitor_pnp(it.get("InstanceName") or "")
+            if not pnp:
+                continue
+            try:
+                w = int(it.get("MaxHorizontalImageSize") or 0)
+                h = int(it.get("MaxVerticalImageSize") or 0)
+            except Exception:
+                continue
+            if w > 0 and h > 0:
+                sizes[pnp.upper()] = (w, h)
+    except Exception:
+        pass
+    return sizes
 
 
 def detect_hardware() -> HardwareInfo:
@@ -99,8 +219,8 @@ def detect_hardware() -> HardwareInfo:
                 name = (g.get("Name") or "").strip()
                 if not name:
                     continue
-                # 跳过纯虚拟/基础显示适配器
-                if "Virtual" in name or "Basic" in name or "Microsoft" in name:
+                # v18.31 跳过虚拟/伪显卡：黑名单见 VIRTUAL_GPU_KEYWORDS
+                if _is_virtual_gpu(name):
                     continue
                 info.gpu_name = name
                 info.gpu_vram_bytes = int(g.get("AdapterRAM") or 0)
@@ -136,18 +256,53 @@ def detect_hardware() -> HardwareInfo:
         except Exception:
             pass
 
-    # 显示器数量
+    # v18.31 显示器：取名称 + PnP 设备 ID，再与 EDID 物理尺寸关联，得到每台英寸数
     out = _ps(
         "(Get-CimInstance Win32_PnPEntity -Filter \"PNPClass='Monitor'\" | "
-        "Where-Object {$_.Name} | Measure-Object | Select-Object -ExpandProperty Count)"
+        "Where-Object {$_.Name} | Select-Object Name,PNPDeviceID | ConvertTo-Json)"
     )
-    if out and out.strip().isdigit():
-        info.monitor_count = max(1, int(out.strip()))
+    edid = _monitor_edid_sizes()
+    monitors = []
+    if out:
+        try:
+            arr = json.loads(out)
+            if isinstance(arr, dict):
+                arr = [arr]
+            for m in arr:
+                pnp = _extract_monitor_pnp(m.get("PNPDeviceID") or "")
+                size = edid.get(pnp.upper()) if pnp else None
+                # 单显示器时 PnP 码可能因 UID 后缀对不上，直接取唯一一条 EDID
+                if not size and len(arr) == 1 and len(edid) == 1:
+                    size = next(iter(edid.values()), None)
+                w_cm, h_cm = size or (0, 0)
+                monitors.append({
+                    "label": (m.get("Name") or "").strip(),
+                    "pnp": pnp,
+                    "w_cm": w_cm,
+                    "h_cm": h_cm,
+                    "inches": _diag_inches(w_cm, h_cm),
+                })
+        except Exception:
+            monitors = []
+    info.monitors = monitors
+    info.monitor_count = max(1, len(monitors)) if monitors else 1
 
-    # 电池（笔记本判定）
-    out = _ps("(Get-CimInstance Win32_Battery | Measure-Object | Select-Object -ExpandProperty Count)")
-    if out and out.strip().isdigit() and int(out.strip()) > 0:
-        info.has_battery = True
+    # v18.31 便携机判定：机箱类型为准，电池仅兜底
+    # （旧实现只看 Win32_Battery，台式机接 UPS 会被误判成笔记本）
+    chassis_raw = _ps(
+        "(Get-CimInstance Win32_SystemEnclosure | Select-Object -ExpandProperty ChassisTypes)")
+    chassis = set()
+    for tok in re.findall(r"\d+", chassis_raw or ""):
+        try:
+            chassis.add(int(tok))
+        except Exception:
+            pass
+    model = (_ps("(Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty Model)")
+             or "").strip()
+    bat_out = _ps("(Get-CimInstance Win32_Battery | Measure-Object | Select-Object -ExpandProperty Count)")
+    has_battery = bool(bat_out and bat_out.strip().isdigit() and int(bat_out.strip()) > 0)
+    info.has_battery = has_battery
+    info.is_laptop = _detect_laptop(chassis, model, has_battery)
 
     # 操作系统
     out = _ps("(Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption)")
@@ -158,6 +313,8 @@ def detect_hardware() -> HardwareInfo:
         "cpu": info.cpu_name, "gpu": info.gpu_name,
         "ram_gb": round(info.ram_bytes / 1e9, 1),
         "disks": info.disks, "monitors": info.monitor_count,
+        "is_laptop": info.is_laptop,
+        "monitor_inches": [m.get("inches") for m in info.monitors],
     }
     return info
 

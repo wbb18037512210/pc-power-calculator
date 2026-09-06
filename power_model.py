@@ -61,6 +61,39 @@ STATIC = {
 }
 PSU_EFFICIENCY = 0.85  # 电源转换效率（铜牌≈0.85，金牌≈0.90）
 
+# v18.31 显示器功耗：按 EDID 物理面积连续建模（替代原来的三档粗估）
+# 背光功耗近似与发光面积成正比。单位功耗标定为 0.0181 W/cm²——
+# 24.5" 1440p（54×31cm = 1655cm²）正好得 30.0W，与旧常量 monitor_1440p 一致，
+# 保证既有估算结果不跳变（回归安全）。
+MONITOR_W_PER_CM2 = 0.0181
+# 分辨率系数：同面积下面板与驱动板差异（1080p 更低，4K 因背光分区成熟反而更省）
+MONITOR_RES_FACTOR = ((2160, 0.95), (1440, 1.00), (1080, 0.75))
+MONITOR_W_MIN = 8.0     # 笔记本小屏下限
+MONITOR_W_MAX = 70.0    # 超大屏/电视上限
+
+
+def monitor_watts(inches=None, w_cm: float = 0.0, h_cm: float = 0.0,
+                  vertical_px: int = 0):
+    """按 EDID 物理尺寸估算单台显示器功耗 W。
+
+    优先用实测宽高(cm)；只有英寸时按 16:9 反推面积。
+    返回 None 表示无 EDID 数据，调用方应回退到分辨率分档。
+    """
+    if w_cm > 0 and h_cm > 0:
+        area = w_cm * h_cm
+    elif inches and inches > 0:
+        diag_cm = float(inches) * 2.54
+        h = diag_cm * 9.0 / ((16.0 ** 2 + 9.0 ** 2) ** 0.5)
+        area = h * h * 16.0 / 9.0
+    else:
+        return None
+    factor = 1.0
+    for lower_px, f in MONITOR_RES_FACTOR:
+        if vertical_px >= lower_px:
+            factor = f
+            break
+    return max(MONITOR_W_MIN, min(MONITOR_W_MAX, area * MONITOR_W_PER_CM2 * factor))
+
 # v18.11 动态效率曲线：80 PLUS 金牌典型曲线（负载率 -> 转换效率）。
 # 电源效率并非恒定值——轻载（<20%）和满载都偏低，50% 附近最高，
 # 固定 0.85 会在低负载时高估、高负载时低估实际插墙功耗。
@@ -198,13 +231,35 @@ def build_model(hw, psu_efficiency: float = PSU_EFFICIENCY) -> PowerModel:
     comps["SSD"] = round(ssd_n * STATIC["ssd"], 1)
     comps["HDD"] = round(hdd_n * STATIC["hdd"], 1)
     comps["风扇"] = STATIC["fan"]
-    # 显示器分辨率估算
-    mon_w = STATIC["monitor_1440p"]
-    if "3840" in hw.gpu_resolution or "2160" in hw.gpu_resolution:
-        mon_w = STATIC["monitor_4k"]
-    elif "1920" in hw.gpu_resolution:
-        mon_w = STATIC["monitor_1080p"]
-    comps["显示器"] = round(hw.monitor_count * mon_w, 1)
+    # v18.31 显示器功耗：优先按 EDID 物理尺寸逐台估算，取不到 EDID 才回退分辨率分档
+    res = str(getattr(hw, "gpu_resolution", "") or "")
+    try:
+        vertical_px = int(res.lower().split("x")[-1])
+    except Exception:
+        vertical_px = 0
+    if "3840" in res or "2160" in res:
+        mon_w_fallback = STATIC["monitor_4k"]
+    elif "1920" in res:
+        mon_w_fallback = STATIC["monitor_1080p"]
+    else:
+        mon_w_fallback = STATIC["monitor_1440p"]
+
+    # 台数取 monitor_count 与 monitors 的并集：count 反映枚举到的台数（用户可改），
+    # monitors 提供 EDID 尺寸。测到尺寸的按面积精算，测不到的按分辨率档补齐。
+    monitors = list(getattr(hw, "monitors", None) or [])
+    n_total = max(int(getattr(hw, "monitor_count", 1) or 1), len(monitors), 1)
+    total_mon_w = 0.0
+    sized = 0
+    for mon in monitors:   # 注意：变量名不能是 m，会覆盖外层 PowerModel 实例
+        w = monitor_watts(mon.get("inches"), mon.get("w_cm") or 0.0,
+                          mon.get("h_cm") or 0.0, vertical_px)
+        if w is None:
+            continue       # 这台无 EDID，计入下面的 fallback 补齐
+        total_mon_w += w
+        sized += 1
+    if n_total > sized:
+        total_mon_w += (n_total - sized) * mon_w_fallback
+    comps["显示器"] = round(total_mon_w, 1)
     comps["外设"] = STATIC["peripheral"]
 
     m.static_idle = round(sum(comps.values()), 1)
