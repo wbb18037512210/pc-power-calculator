@@ -172,6 +172,20 @@ hw4.monitor_count = 1
 check("monitor存在但无EDID时回退", PM.build_model(hw4).components["显示器"], 30.0)
 
 
+# ---------------------------------------------------------------- v18.35 风扇转速解析
+print("--- v18.35 风扇转速 ---")
+check("fans解析-数组过滤0值",
+      H._parse_fans_json('[{"Name":"CPU Fan","Value":1200.4},{"Name":"GPU","Value":0}]'),
+      [("CPU Fan", 1200)])
+check("fans解析-单对象", H._parse_fans_json('{"Name":"Fan1","Value":900}'), [("Fan1", 900)])
+check("fans解析-空串", H._parse_fans_json(""), [])
+check("fans解析-垃圾", H._parse_fans_json("not json"), [])
+check("fans解析-缺Value", H._parse_fans_json('[{"Name":"X"}]'), [])
+_r1 = H.fan_rpms_cached()
+_r2 = H.fan_rpms_cached()
+check("fans缓存-命中一致", _r1 == _r2, True)   # 第二次应走缓存（不 spawn PowerShell）
+
+
 print()
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
 for f in FAIL:

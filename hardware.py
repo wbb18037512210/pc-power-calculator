@@ -99,6 +99,61 @@ def _ps(script: str, timeout: int = 15) -> Optional[str]:
         return None
 
 
+# ---------------- v18.35 风扇转速 ----------------
+# Windows 没有标准 WMI 风扇接口（Win32_Fan 基本全空），唯一免驱来源是
+# LibreHardwareMonitor / OpenHardwareMonitor 暴露的 WMI 命名空间——装了才有数据，
+# 没装就显示 —（降级，不报错）。PowerShell spawn 有数百 ms 开销，故 10s 缓存节流；
+# 两个命名空间都不存在时 120s 才重试一次，避免无意义开销。
+_FAN_TTL_OK = 10.0
+_FAN_TTL_FAIL = 120.0
+_FAN_NAMESPACES = ("root/LibreHardwareMonitor", "root/OpenHardwareMonitor")
+_fan_state = {"last_ts": 0.0, "ttl": 0.0, "rpms": []}
+
+
+def _parse_fans_json(out: str) -> list:
+    """解析 ConvertTo-Json 输出为 [(name, rpm), ...]；容错单对象/数组/空。"""
+    try:
+        data = json.loads(out)
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    fans = []
+    for d in data or []:
+        if not isinstance(d, dict):
+            continue
+        try:
+            v = float(d.get("Value"))
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            fans.append((str(d.get("Name") or "Fan"), round(v)))
+    return fans
+
+
+def _query_fan_rpms() -> list:
+    for ns in _FAN_NAMESPACES:
+        out = _ps(f"(Get-CimInstance -Namespace {ns} -ClassName Sensor "
+                  f"-Filter \"SensorType='Fan'\" -ErrorAction SilentlyContinue | "
+                  f"Select-Object Name,Value | ConvertTo-Json -Compress)", timeout=6)
+        fans = _parse_fans_json(out or "")
+        if fans:
+            return fans
+    return []
+
+
+def fan_rpms_cached() -> list:
+    now = time.time()
+    st = _fan_state
+    if now - st["last_ts"] < st["ttl"]:
+        return st["rpms"]
+    rpms = _query_fan_rpms()
+    st["rpms"] = rpms
+    st["last_ts"] = now
+    st["ttl"] = _FAN_TTL_OK if rpms else _FAN_TTL_FAIL
+    return rpms
+
+
 def _is_virtual_gpu(name: str) -> bool:
     """判断显示适配器名称是否为虚拟/伪显卡（应被排除，不能当主显卡）。
 
@@ -531,6 +586,13 @@ def sample_dynamic(prev_net):
                 info["up_kbs"] = max(0.0, (cur[1] - prev_net[1]) / dt / 1024.0)
         except Exception:
             pass
+    # v18.35 风扇转速（内部 10s 缓存节流；worker 线程执行，不卡 UI）
+    try:
+        fans = fan_rpms_cached()
+        if fans:
+            info["fans"] = fans
+    except Exception:
+        pass
     return info, cur
 
 

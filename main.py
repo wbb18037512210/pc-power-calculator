@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCharts import (QChart, QChartView, QLineSeries, QValueAxis,
                               QBarSeries, QBarSet, QBarCategoryAxis, QDateTimeAxis)
 from PySide6.QtGui import (QPainter, QFont, QColor, QAction, QPixmap, QIcon,
-                           QTextDocument)
+                           QTextDocument, QBrush)
 # v18.26 报告导出 PNG：沿用 QTextDocument 引擎直接画到 QImage，纯 Qt、完全离线，
 # 相比 QWebEngine（+100MB）或 reportlab（第三方）成本最低，也不依赖 QtPrintSupport。
 
@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.34"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.35"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -644,7 +644,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"PC 电脑用电电费计算器 {APP_VERSION}")
-        self.resize(1080, 880)  # v18.17 收窄主界面（此前被内容顶到 1983px，最小 944）
+        self.resize(1080, 920)  # v18.35 +40px：实时卡片（含硬件信息块）sizeHint 需要
         self.setStyleSheet(CSS)
 
         # v18.29+ W3：降级账本（收敛静默异常，给维护者/用户可见信号）
@@ -920,12 +920,13 @@ class MainWindow(QMainWindow):
         # 填补 v18.5 删除本机配置卡片后留下的右侧空白）。
         row = QHBoxLayout(); row.setSpacing(16)
         outer.addLayout(row, 1)
-        # 4 列 x 2 行：7 个指标排一行时，光是大号数字就占掉约 1226px，
-        # 主界面被迫跟着变宽。分两行后最小宽度约为 4 个指标。
+        # v18.35 读数 2 行 x 3 列（旧 4+2 布局第二行右侧两个格子是空的，
+        # 用户截图反馈的空白）。列更宽（~200px），大号数字不再拥挤。
         grid = QGridLayout(); grid.setHorizontalSpacing(16); grid.setVerticalSpacing(10)
+        for _c3 in range(3):
+            grid.setColumnStretch(_c3, 1)   # v18.35 三列均分，避免某列被文本顶宽
         row.addLayout(grid, 3)
         row.addWidget(self._sysinfo_panel(), 2)
-
         # 插座功耗（大）
         col1 = QVBoxLayout(); col1.setSpacing(2)
         col1.addWidget(self._lbl("插座实时功耗", "title"))
@@ -984,26 +985,51 @@ class MainWindow(QMainWindow):
         self.idle_sub = self._lbl("空闲时段耗电", "sub")
         col7.addWidget(self.idle_sub)
 
-        # 详解行独占整行：最长的一句，给它完整宽度，避免撑宽上面 7 列
+        # 详解行独占整行：最长的一句，给它完整宽度，避免撑宽上面 7 列。
+        # v18.35 行尾并入「重新检测硬件」按钮 + 检测状态（原在硬件信息块顶部，
+        # 挪出后信息块可独占卡片右侧全高）。
         self.wall_sub = self._lbl(
             "插座 0.0 W ＝ 直流 0.0 + 损耗 0.0 · 效率 0.85", "sub")
         self.wall_sub.setWordWrap(True)
         self.wall_sub.setMinimumWidth(0)
-        outer.addWidget(self.wall_sub)
+        btn_row = QHBoxLayout(); btn_row.setSpacing(10)
+        btn_rd = QPushButton("⟳ 重新检测硬件")
+        btn_rd.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_rd.setToolTip("插拔硬盘 / 显示器、更换硬件后点此重建功耗模型。\n"
+                          "静态功耗与部件清单会随之变化，电源负载率与转换效率也跟着重算。\n"
+                          "（校准数据与电源额定功率设置会保留）")
+        btn_rd.setStyleSheet(
+            "QPushButton{background:#f4f6fa;border:1px solid #d6dbe6;border-radius:5px;"
+            "padding:3px 10px;font-size:12px;color:#2f3b52;}"
+            "QPushButton:hover{background:#e8eefb;border-color:#9db4e8;}")
+        btn_rd.clicked.connect(self._redetect_hardware)
+        self._hw_detect_lbl = QLabel("启动时已检测")
+        self._hw_detect_lbl.setStyleSheet("font-size:11px;color:#8a94a6;")
+        # v18.35 状态标签从控制条挪到详解行行尾（控制条整行让给 9 个平铺按钮）
+        self.status_lbl = QLabel("就绪")
+        self.status_lbl.setStyleSheet("color:#6b7488;font-size:12px;")
+        self.status_lbl.setMinimumWidth(1)
+        btn_row.addWidget(self.wall_sub, 1)
+        btn_row.addWidget(self.status_lbl)
+        btn_row.addWidget(btn_rd)
+        btn_row.addWidget(self._hw_detect_lbl)
+        outer.addLayout(btn_row)
 
         for _i, _col in enumerate((col1, col2, col3, col4, col5, col7)):
-            grid.addLayout(_col, _i // 4, _i % 4)
+            grid.addLayout(_col, _i // 3, _i % 3)
 
         # v18.17 QLabel 默认「最小宽度 = 整段文本宽度」。填上真实数据后
         # （如 "1,234.5 W"、"23:59:59"）各列会互相顶宽，卡片最小宽度从
-        # 空态 792px 涨到 1232px，主界面又被撑开。改为可压缩：
-        # 窄窗口下宁可让文字截断，也不要把窗口顶宽。
-        # v18.34 注意排除硬件信息块的操作行标签——Ignored 会把它压成 0 宽。
+        # 空态 792px 涨到 1232px，主界面又被撑开。
+        # v18.35 不能用 Ignored 策略：Ignored 项 sizeHint 记 0，QGridLayout
+        # 按 sizeHint 分配后其余列全被压成 0 宽——6 个读数列只剩 1 列显示、
+        # 右侧大片空白（用户截图反馈的根因）。改 setMinimumWidth(1)：
+        # 显式覆盖 minimumSizeHint（0 = 未设置无效），列按内容铺开、窄窗口
+        # 下仍可压缩不顶宽（与 v18.33 标题行同款修法）。
         for _lb in c.findChildren(QLabel):
             if _lb is getattr(self, "_hw_detect_lbl", None):
                 continue
-            _lb.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-            _lb.setMinimumWidth(0)
+            _lb.setMinimumWidth(1)
 
         return c
 
@@ -1050,10 +1076,12 @@ class MainWindow(QMainWindow):
         h = QLabel("功耗构成（估算）")
         h.setStyleSheet("font-size:13px;color:#2b3552;font-weight:600;")
         lay.addWidget(h)
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["部件", "功耗 W"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["部件", "使用率", "功耗 W", "温度"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.verticalHeader().hide()
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         lay.addWidget(self.table, 1)
@@ -1095,47 +1123,27 @@ class MainWindow(QMainWindow):
         return (f"运行 {hh}时{mm:02d}分 · {now:%m-%d} [{wk}] {now:%H:%M}")
 
     def _sysinfo_panel(self) -> QWidget:
-        """v18.34 改为内嵌块：不再是最左侧固定宽侧栏，而是实时卡片右半区。
+        """v18.35 改为内嵌块：不再是最左侧固定宽侧栏，而是实时卡片右半区。
 
-        竖排 = 顶部操作行（重新检测硬件 + 检测状态） + 硬件信息富文本。
+        「重新检测硬件」按钮已挪到卡片底部详解行行尾（v18.35），
+        本块只剩硬件信息富文本，独占卡片右侧全高。
         成员名 sysinfo_view / _hw_detect_lbl 保持不变，_update_sysinfo /
         _redetect_hardware 无需改动。
         """
-        c = QWidget()
-        v = QVBoxLayout(c)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(6)
         self.sysinfo_view = QTextBrowser()
         self.sysinfo_view.setStyleSheet(
             "QTextBrowser{background:#f7f9fc;color:#1a1a1a;"
             "border:1px solid #eef1f6;border-radius:8px;"
-            "font-family:'Consolas','Microsoft YaHei';font-size:12px;"
+            "font-family:'Consolas','Microsoft YaHei';font-size:11px;"
             "padding:8px 10px;}")
         self.sysinfo_view.setOpenExternalLinks(False)
         self.sysinfo_view.setFrameShape(QFrame.Shape.NoFrame)
-        # v18.12 硬件重检测：插拔硬盘/显示器、换硬件后手动重建功耗模型，
-        # 否则模型只在启动时构建一次，之后增减硬件估算值不会变。
-        hdr = QWidget(); hh = QHBoxLayout(hdr)
-        hh.setContentsMargins(0, 0, 0, 0); hh.setSpacing(6)
-        btn_rd = QPushButton("⟳ 重新检测硬件")
-        btn_rd.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_rd.setToolTip("插拔硬盘 / 显示器、更换硬件后点此重建功耗模型。\n"
-                          "静态功耗与部件清单会随之变化，电源负载率与转换效率也跟着重算。\n"
-                          "（校准数据与电源额定功率设置会保留）")
-        btn_rd.setStyleSheet(
-            "QPushButton{background:#f4f6fa;border:1px solid #d6dbe6;border-radius:5px;"
-            "padding:3px 8px;font-size:12px;color:#2f3b52;}"
-            "QPushButton:hover{background:#e8eefb;border-color:#9db4e8;}")
-        btn_rd.clicked.connect(self._redetect_hardware)
-        hh.addWidget(btn_rd)
-        self._hw_detect_lbl = QLabel("启动时已检测")
-        self._hw_detect_lbl.setStyleSheet("font-size:11px;color:#8a94a6;")
-        hh.addWidget(self._hw_detect_lbl, 1)
-        v.addWidget(hdr)
-        v.addWidget(self.sysinfo_view, 1)
+        # v18.35 双列后内容全高 ~200px：设最小高度让实时卡片自动加高，
+        # 从下方功耗曲线区挪 ~30px，信息区完整显示不出滚动条
+        self.sysinfo_view.setMinimumHeight(220)
         self._sys_dyn = {}
         self._sys_static = {}
-        return c
+        return self.sysinfo_view
 
     @staticmethod
     def _bar(pct: float, width: int = 12) -> str:
@@ -1191,59 +1199,74 @@ class MainWindow(QMainWindow):
         mhz = dyn.get("mhz") or (s.get("mhz") or 0)
         vram = s.get("gpuvram")
         vram_txt = f"{vram / (1 << 30):.0f}GB" if vram else "—"
-        fw = s.get("fw") or ""
-        fw_txt = "UEFI" if fw == "UEFI" else ("BIOS" if "Legacy" in fw else (fw or "—"))
-        sb_txt = "SB开" if s.get("sb") == 1 else ("SB关" if fw_txt == "UEFI" else "")
         Y = "<span style='color:#111111;font-weight:bold'>"   # v18.5 白底黑字：标签黑色加粗
         E = "</span>"
         SUB = "margin-left:12px;color:#555555;"
-        L = []
-        # v18.33 运行时间/操作系统已上移到顶部标题后（_hdr_uptime/_hdr_os），侧栏不再重复
-        L.append(f"<div style='margin:2px 0 6px 0;'>{Y}启动模式{E} {fw_txt}"
-                 + (f"　{sb_txt}" if sb_txt else "") + "</div>")
-        L.append(f"<div style='margin-bottom:6px;'>{Y}主　　板{E} {self._short_model(g('mb'), 24)}</div>")
+        # v18.35 双列布局：硬件信息从 288px 窄栏变成实时卡片右半区（~400px 宽、
+        # 高度有限），单列 17 行放不下会出滚动条。拆成左右两列（table 布局，
+        # QTextDocument 唯一可靠的分栏方案），高度减半、不再滚动。
+        LA = []   # 左列：主板/处理器/内存/网络
+        LB = []   # 右列：显卡/磁盘
+        # v18.35 「启动模式」按用户要求删除（UEFI/Legacy + SecureBoot 属低频
+        # 信息，占一行空间不值）；v18.33 起运行时间/操作系统也已在顶部标题后
+        LA.append(f"<div style='margin:2px 0 3px 0;'>{Y}主　板{E} {self._short_model(g('mb'), 18)}</div>")
         cpu_name = (g('cpu') or self.hw.cpu_name or "—").strip()
         cpu_badge = (" <span style='color:#b8860b;font-weight:bold;'>⚠ 未识别</span>"
                      ) if getattr(self.model, "cpu_conf", "high") == "low" else ""
-        L.append(f"<div style='margin-bottom:1px;'>{Y}处 理 器{E} "
-                 f"{self._short_model(cpu_name)}{cpu_badge}</div>")
+        LA.append(f"<div style='margin-bottom:1px;'>{Y}处理器{E} "
+                  f"{self._short_model(cpu_name, 18)}{cpu_badge}</div>")
         cpu_load = self.cur.get("cpu_load") if isinstance(self.cur, dict) else None
         cpu_load = 0.0 if cpu_load is None else cpu_load
-        L.append(f"<div style='{SUB}margin-bottom:6px;'>{g('cores') or '—'}核"
-                 f"{g('threads') or '—'}线程 · {mhz / 1000.0:.2f}GHz · "
-                 f"{self._temp_html(cpu_t, 75, 85)}　{self._bar(cpu_load, 8)}</div>")
-        L.append(f"<div style='margin-bottom:1px;'>{Y}物理内存{E} {gb(ram_total)}　"
-                 f"{self._bar(ram_pct, 8)}</div>")
-        L.append(f"<div style='{SUB}margin-bottom:3px;'>已用 {gb(ram_used)} · 可用 {gb(ram_free)}</div>")
-        for m in (s.get("mods") or [])[:4]:
-            mn = (m.get("m") or "").replace("Unknown", "GeIL").split()[0] if (m.get("m") or "") else "—"
-            cap = int(m.get("cap") or 0) / (1 << 30)
-            L.append(f"<div style='{SUB}margin-bottom:1px;'>{mn} {cap:.0f}GB "
-                     f"DDR4/{m.get('clk') or m.get('spd') or '—'}</div>")
+        LA.append(f"<div style='{SUB}margin-bottom:3px;'>{g('cores') or '—'}核"
+                  f"{g('threads') or '—'}线程 · {mhz / 1000.0:.2f}GHz · "
+                  f"{self._temp_html(cpu_t, 75, 85)}　{self._bar(cpu_load, 8)}</div>")
+        LA.append(f"<div style='margin-bottom:1px;'>{Y}物理内存{E} {gb(ram_total)}　"
+                  f"{self._bar(ram_pct, 8)}</div>")
+        LA.append(f"<div style='{SUB}margin-bottom:3px;'>已用 {gb(ram_used)} · 可用 {gb(ram_free)}</div>")
+        mods = (s.get("mods") or [])[:4]
+        if mods:
+            _parts = []
+            for m in mods:
+                mn = (m.get("m") or "").replace("Unknown", "GeIL").split()[0] if (m.get("m") or "") else "—"
+                cap = int(m.get("cap") or 0) / (1 << 30)
+                _parts.append(f"{mn} {cap:.0f}G")
+            LA.append(f"<div style='{SUB}margin-bottom:3px;'>内存条 {' · '.join(_parts)}"
+                      f" DDR4/{mods[0].get('clk') or mods[0].get('spd') or '—'}</div>")
+        # v18.35 网络（含 IP/速率）紧跟物理内存/内存条之后（用户指定位置），
+        # 左列顺序：启动模式 → 主板 → 处理器 → 内存 → 网络；右列：显卡 → 磁盘。
+        nic = g('nic')
+        if nic:
+            dn = dyn.get("down_kbs"); upk = dyn.get("up_kbs")
+            speed = (f" ↓{dn:.1f}K ↑{upk:.1f}K"
+                     if dn is not None and upk is not None else "")
+            LA.append(f"<div style='margin:4px 0 1px;'>{Y}网络{E} {self._short_model(nic, 14)}</div>")
+            LA.append(f"<div style='{SUB}margin-bottom:3px;'>IP {g('ip') or '—'}{speed}</div>")
         gpu_badge = (" <span style='color:#b8860b;font-weight:bold;'>⚠ 未识别</span>"
                      ) if getattr(self.model, "gpu_conf", "high") == "low" else ""
-        L.append(f"<div style='margin:4px 0 1px;'>{Y}显卡{E} "
-                 f"{self._short_model(g('gpuname') or self.hw.gpu_name)} · {vram_txt} · "
-                 f"{self._temp_html(gpu_t, 65, 78)}{gpu_badge}</div>")
-        L.append(f"<div style='{SUB}margin-bottom:6px;'>{g('gpures') or '—'}\"　"
-                 f"{g('gpuref') or '—'}Hz</div>")
+        LB.append(f"<div style='margin:2px 0 1px;'>{Y}显卡{E} "
+                  f"{self._short_model(g('gpuname') or self.hw.gpu_name, 18)} · {vram_txt} · "
+                  f"{self._temp_html(gpu_t, 65, 78)}{gpu_badge}</div>")
+        LB.append(f"<div style='{SUB}margin-bottom:3px;'>{g('gpures') or '—'}\"　"
+                  f"{g('gpuref') or '—'}Hz</div>")
         dtemps = dyn.get("disk_temps") or {}
         for i, dk in enumerate(g('disks') or []):
             media = (dk.get("media") or "").upper()
             tag = "SSD" if "SSD" in media else ("HDD" if "HDD" in media else (dk.get("bus") or ""))
             dt = dtemps.get(dk.get("model") or "")
-            L.append(f"<div style='margin-bottom:1px;'>{Y}磁盘{i}{E} "
-                     f"{self._short_model(dk.get('model'), 16)} [{tag}] "
-                     f"{dk.get('sizeGB') or '—'}GB {dk.get('letters') or ''} "
-                     f"{self._temp_html(dt, 45, 55)}</div>")
-        nic = g('nic')
-        if nic:
-            dn = dyn.get("down_kbs"); upk = dyn.get("up_kbs")
-            speed = (f"↓{dn:.1f} K/s ↑{upk:.1f} K/s"
-                     if dn is not None and upk is not None else "↓— ↑—")
-            L.append(f"<div style='margin:4px 0 1px;'>{Y}网　络{E} {self._short_model(nic, 22)}</div>")
-            L.append(f"<div style='{SUB}'>IP {g('ip') or '—'} · {speed}</div>")
-        return "".join(L)
+            LB.append(f"<div style='margin-bottom:1px;'>{Y}磁盘{i}{E} "
+                      f"{self._short_model(dk.get('model'), 14)} [{tag}] "
+                      f"{dk.get('sizeGB') or '—'}GB {dk.get('letters') or ''} "
+                      f"{self._temp_html(dt, 45, 55)}</div>")
+        # v18.35 风扇转速（LibreHardwareMonitor/OpenHardwareMonitor WMI，装了才有）
+        fans = dyn.get("fans") or []
+        if fans:
+            fan_txt = " · ".join(f"{n} {v}RPM" for n, v in fans[:3])
+            LB.append(f"<div style='margin:4px 0 1px;'>{Y}风扇{E} {fan_txt}</div>")
+        # table 分栏（HTML 属性 width/valign——QTextDocument 对嵌套 table 的
+        # CSS 不可靠，v18.32 报告排版已验证过）
+        return (f"<table width='100%' cellspacing='0' cellpadding='0'>"
+                f"<tr><td width='50%' valign='top'>{''.join(LA)}</td>"
+                f"<td width='50%' valign='top'>{''.join(LB)}</td></tr></table>")
 
     def _update_sysinfo(self):
         # v18.33 标题后的运行时间标签每拍都更新（QLabel.setText 开销极小），
@@ -1369,21 +1392,22 @@ class MainWindow(QMainWindow):
         self.btn_hourly.clicked.connect(self.open_hourly)
         self.btn_settings = QPushButton("设置"); self.btn_settings.setObjectName("ghost")
         self.btn_settings.clicked.connect(self.open_settings)
-        self.status_lbl = QLabel("就绪"); self.status_lbl.setStyleSheet("color:#6b7488;font-size:12px;")
         self.btn_apps = QPushButton("软件耗电"); self.btn_apps.setObjectName("ghost")
         self.btn_apps.clicked.connect(self.open_apps)
-        # v18.17 两行排布：9 个按钮挤在一行会把控制条最小宽度顶到 1020px。
-        # 改成每行 5 个的网格后，最小宽度降到约 5 个按钮，主界面才能收窄。
+        # v18.35 平铺：9 个按钮一行均分铺满整张卡片（此前 5+4 两行第二行
+        # 右侧是空的，用户截图要求把空白平铺掉）。卡片全宽 ~1012px，
+        # 9 按钮 × ~105px + 间距刚好放下；列 stretch 均分，窄窗口按比例压缩。
+        # 状态标签挪到实时卡片底部详解行行尾，控制条整行让给按钮。
         grid = QGridLayout(); grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(8); grid.setVerticalSpacing(8)
+        grid.setHorizontalSpacing(8)
         _btns = (self.btn_reset, self.btn_export, self.btn_csv, self.btn_compare,
                  self.btn_history, self.btn_sim, self.btn_hourly, self.btn_apps,
                  self.btn_settings)
         for _i, _b in enumerate(_btns):
-            grid.addWidget(_b, _i // 4, _i % 4)
-        lay.addLayout(grid)
-        lay.addItem(QSpacerItem(20, 10, QSizePolicy.Expanding))
-        lay.addWidget(self.status_lbl)
+            grid.addWidget(_b, 0, _i)
+            grid.setColumnStretch(_i, 1)
+            _b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        lay.addLayout(grid, 1)
         return c
 
     @staticmethod
@@ -1858,23 +1882,132 @@ class MainWindow(QMainWindow):
             c += (kwh - self.tier_l2) * self.tier_r3
         return c
 
+    # v18.35 构成表固定行顺序（用户指定）；不在表内的部件（待机/损耗等）
+    # 按原顺序排在末尾
+    _BD_ORDER = ("CPU", "GPU", "内存", "风扇", "SSD", "HDD",
+                 "主板/芯片组", "显示器", "外设")
+
+    def _sorted_bd_keys(self, keys):
+        order = {n: i for i, n in enumerate(self._BD_ORDER)}
+        unk = 0
+        def _key(k):
+            nonlocal unk
+            if k in order:
+                return (order[k], 0)
+            unk += 1
+            return (99, unk)
+        return sorted(keys, key=_key)
+
+    def _util_pct(self, name):
+        """v18.35 使用率(0-100)：CPU=真实负载，GPU=估算功率/TDP，内存=内存占用；
+        其余部件返回 None（进度条显示 —）。"""
+        n = str(name).upper()
+        if "CPU" in n:
+            v = self.cur.get("cpu_load") if isinstance(self.cur, dict) else None
+            return max(0.0, float(v)) if v is not None else None
+        if "GPU" in n:
+            gp = self.cur.get("gpu_power") if isinstance(self.cur, dict) else None
+            tdp = float(getattr(self.model, "gpu_tdp", 0) or 0)
+            if gp is not None and tdp > 0:
+                return min(100.0, float(gp) / tdp * 100)
+            return None
+        if "内存" in str(name):
+            v = (getattr(self, "_sys_dyn", None) or {}).get("ram_pct")
+            return max(0.0, float(v)) if v else None
+        return None
+
+    @staticmethod
+    def _make_util_bar() -> QProgressBar:
+        pb = QProgressBar()
+        pb.setRange(0, 100)
+        pb.setTextVisible(True)
+        pb.setFormat("—")
+        pb.setFixedHeight(16)
+        pb.setStyleSheet(
+            "QProgressBar{border:1px solid #d6dbe6;border-radius:3px;background:#f2f4f8;"
+            "text-align:center;font-size:10px;color:#2b3552;}"
+            "QProgressBar::chunk{background:#5aa832;border-radius:2px;}")
+        return pb
+
+    def _update_util_bar(self, pb, name):
+        """v18.35 刷新进度条：值 + 档位颜色（<70 绿 / <90 橙 / ≥90 红）。
+        颜色样式只在跨档时重设，避免每 2s 全表 setStyleSheet。"""
+        pct = self._util_pct(name)
+        if pct is None:
+            pb.setValue(0)
+            pb.setFormat("—")
+            return
+        pb.setFormat("%p%")
+        pb.setValue(int(pct + 0.5))
+        col = "#5aa832" if pct < 70 else ("#d99a17" if pct < 90 else "#d8492f")
+        if getattr(pb, "_chunk_col", None) != col:
+            pb.setStyleSheet(
+                "QProgressBar{border:1px solid #d6dbe6;border-radius:3px;background:#f2f4f8;"
+                "text-align:center;font-size:10px;color:#2b3552;}"
+                f"QProgressBar::chunk{{background:{col};border-radius:2px;}}")
+            pb._chunk_col = col
+
+    def _temp_text_color(self, name):
+        """v18.35 构成表「温度」列：CPU/GPU/SSD/HDD 有传感器数据，其余 —。
+        返回 (文本, QColor|None)，阈值与侧栏 _temp_html 一致。"""
+        n = str(name).upper()
+        dyn = getattr(self, "_sys_dyn", None) or {}
+        t = None
+        warn, hot = 75, 85
+        if "CPU" in n:
+            t = dyn.get("cpu_temp")
+        elif "GPU" in n:
+            t = dyn.get("gpu_temp")
+            warn, hot = 65, 78
+        elif "SSD" in n or "HDD" in n:
+            want = "SSD" if "SSD" in n else "HDD"
+            temps = dyn.get("disk_temps") or {}
+            for dk in ((getattr(self, "_sys_static", None) or {}).get("disks") or []):
+                if want in (dk.get("media") or "").upper():
+                    t = temps.get(dk.get("model") or "")
+                    if t is not None:
+                        break
+            warn, hot = 45, 55
+        if t is None:
+            return "—", None
+        col = QColor("#1a1a1a") if t < warn else (
+            QColor("#d99a17") if t < hot else QColor("#d8492f"))
+        return f"{t:.0f}°", col
+
     def _refresh_breakdown(self):
         bd = self.cur.get("breakdown", {})
-        keys = list(bd.keys())
+        keys = self._sorted_bd_keys(list(bd.keys()))
         # v18.27 差异更新：部件集合不变时只刷新数值单元格，避免每 2s 全表重建
         if getattr(self, "_bd_keys", None) == keys and getattr(self, "_bd_val_items", None):
-            for name, item in zip(keys, self._bd_val_items):
+            for name, item, pb, ti in zip(keys, self._bd_val_items,
+                                          self._bd_util_bars, self._bd_temp_items):
                 item.setText(f"{bd[name]:.1f}")
+                self._update_util_bar(pb, name)
+                txt, col = self._temp_text_color(name)
+                ti.setText(txt)
+                ti.setForeground(col if col is not None else self._bd_temp_gray)
             return
         self.table.setRowCount(0)
         self._bd_val_items = []
+        self._bd_util_bars = []
+        self._bd_temp_items = []
+        self._bd_temp_gray = QBrush(QColor("#8a94a6"))
         for name in keys:
             r = self.table.rowCount()
             self.table.insertRow(r)
             self.table.setItem(r, 0, QTableWidgetItem(str(name)))
+            pb = self._make_util_bar()
+            self._update_util_bar(pb, name)
+            self.table.setCellWidget(r, 1, pb)
             vi = QTableWidgetItem(f"{bd[name]:.1f}")
-            self.table.setItem(r, 1, vi)
+            self.table.setItem(r, 2, vi)
+            txt, col = self._temp_text_color(name)
+            ti = QTableWidgetItem(txt)
+            ti.setForeground(col if col is not None else self._bd_temp_gray)
+            self.table.setItem(r, 3, ti)
             self._bd_val_items.append(vi)
+            self._bd_util_bars.append(pb)
+            self._bd_temp_items.append(ti)
         self._bd_keys = keys
 
     # ---------------- 控制 ----------------
