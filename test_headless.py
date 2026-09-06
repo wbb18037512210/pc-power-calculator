@@ -398,8 +398,11 @@ w._update_sysinfo()
 _html = w.sysinfo_view.toHtml()
 # 注意：不要断言 '网　络' 标签本身——全角空格会被 toHtml() 转成 &#160;，匹配不到；
 # 用网络块的稳定内容（IP 行）代替。
-for key in ("运行时间", "操作系统", "处 理 器", "物理内存", "显卡", "磁盘0", "192.168.1.12"):
+# v18.33：运行时间/操作系统上移到标题 QLabel（_hdr_uptime/_hdr_os），侧栏不再含这两行。
+for key in ("启动模式", "处 理 器", "物理内存", "显卡", "磁盘0", "192.168.1.12"):
     assert key in _html, key
+assert "运行时间" not in _html and "操作系统" not in _html, "v18.33: 这两项应已上移标题"
+assert "运行" in w._hdr_uptime.text() and w._hdr_os.text(), "v18.33: 标题运行时间/OS 标签"
 print("sysinfo panel OK")
 
 # v18 回归3：始终监测语义（无 btn_start；reset 后仍 running）

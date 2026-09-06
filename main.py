@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.32"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.33"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -676,6 +676,7 @@ class MainWindow(QMainWindow):
             self._sys_static = H.collect_system_info()
         except Exception as _e:
             self._sys_static = {}
+        self._refresh_header_static()   # v18.33 标题后的操作系统文本
         self._load_session_maybe()
         # v18 常驻监测：启动即开始，无需手动操作
         if not self.finished:
@@ -835,16 +836,31 @@ class MainWindow(QMainWindow):
         t = QLabel("⚡ PC 用电电费计算器")
         t.setFont(QFont("Microsoft YaHei", 18, QFont.Weight.Bold))
         t.setStyleSheet("color:#1f2a44;")
-        sub = QLabel(f"实时监测 · 24 小时汇总 · {APP_VERSION}")
+        # v18.33 运行时间/操作系统从左侧栏上移到标题后面（左侧栏只留硬件主题）
+        self._hdr_uptime = QLabel("运行 —")
+        self._hdr_uptime.setStyleSheet("color:#5a6478;font-size:12px;")
+        self._hdr_os = QLabel("")
+        self._hdr_os.setStyleSheet("color:#5a6478;font-size:12px;")
+        sub = QLabel(APP_VERSION)
+        sub.setToolTip("实时监测 · 24 小时汇总")
         sub.setStyleSheet("color:#8a93a6;font-size:12px;")
-        # v18.17 允许被压缩：QLabel 默认最小宽度=整段文本宽度，
-        # 这行副标题有 662px，是标题行撑宽主界面的主要原因
-        sub.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        sub.setMinimumWidth(0)
+        # QLabel 的 minimumSizeHint=整段文本宽度，会把主界面顶宽（v18.17 教训）；
+        # 显式 setMinimumWidth(1) 覆盖之（setMinimumWidth(0) 等于未设置，无效）。
+        # 注意不能用 Ignored 策略：布局会把 Ignored 项宽度按 0 分配，整段文字消失
+        # （v18.32 的副标题其实就是这样被压没了，v18.33 一并修正）。
+        for _lbl in (self._hdr_uptime, self._hdr_os, sub):
+            _lbl.setMinimumWidth(1)
         top.addWidget(t)
+        top.addSpacing(12)
+        top.addWidget(self._hdr_uptime)
+        top.addSpacing(12)
+        top.addWidget(self._hdr_os)
         top.addItem(QSpacerItem(20, 10, QSizePolicy.Expanding))
         top.addWidget(sub)
         page.addLayout(top)
+        # v18.33 静态数据在 _build_ui 之后采集（__init__），此处先占位、
+        # 由 _refresh_header_static() 在采集完成后回填操作系统文本
+        self._refresh_header_static()
 
         # v18.5：本机配置卡片已删除——硬件信息由最左侧系统信息面板全量承载，避免重复
 
@@ -1046,6 +1062,29 @@ class MainWindow(QMainWindow):
         return c
 
     # ---------------- 系统信息侧栏（AIDA64 风格，最左侧） ----------------
+    def _refresh_header_static(self):
+        """v18.33 标题后的操作系统文本（静态，采集/重检测后调用）。"""
+        lbl = getattr(self, "_hdr_os", None)
+        if lbl is None:
+            return
+        s = self._sys_static or {}
+        os_txt = self._short_model(s.get("os"), 30)
+        arch = (s.get("osarch") or "").strip()
+        lbl.setText(" · ".join(x for x in (os_txt, arch) if x and x != "—"))
+
+    def _uptime_line(self) -> str:
+        """v18.33 运行时间行（标题后与侧栏共用）：开机时长 + 当前日期时间。"""
+        dyn = self._sys_dyn or {}
+        boot = dyn.get("boot")
+        if not boot:
+            return "运行 —"
+        up = max(0, time.time() - boot)
+        hh, rem = divmod(int(up), 3600)
+        mm, _ss = divmod(rem, 60)
+        now = datetime.now()
+        wk = "一二三四五六日"[now.weekday()]
+        return (f"运行 {hh}时{mm:02d}分 · {now:%m-%d} [{wk}] {now:%H:%M}")
+
     def _sysinfo_panel(self) -> QWidget:
         c = QWidget()
         c.setFixedWidth(288)   # v18.17 收窄：主界面整体变窄
@@ -1122,15 +1161,6 @@ class MainWindow(QMainWindow):
         s = self._sys_static or {}
         dyn = self._sys_dyn or {}
         g = s.get
-        boot = dyn.get("boot")
-        if boot:
-            up = max(0, time.time() - boot)
-            hh, rem = divmod(int(up), 3600); mm, _ss = divmod(rem, 60)
-            now = datetime.now()
-            wk = "一二三四五六日"[now.weekday()]
-            upt_line = f"{hh}时{mm:02d}分　{now:%m-%d} [{wk}] {now:%H:%M}"
-        else:
-            upt_line = "—"
         ram_total = dyn.get("ram_total") or self.hw.ram_bytes or 0
         ram_used = dyn.get("ram_used") or 0
         ram_free = ram_total - ram_used
@@ -1151,10 +1181,8 @@ class MainWindow(QMainWindow):
         E = "</span>"
         SUB = "margin-left:12px;color:#555555;"
         L = []
-        L.append(f"<div style='margin:2px 0 6px 0;'>{Y}运行时间{E} {upt_line}</div>")
-        L.append(f"<div style='margin-bottom:6px;'>{Y}操作系统{E} {self._short_model(g('os'), 30)} "
-                 f"{g('osarch') or ''}</div>")
-        L.append(f"<div style='margin-bottom:6px;'>{Y}启动模式{E} {fw_txt}"
+        # v18.33 运行时间/操作系统已上移到顶部标题后（_hdr_uptime/_hdr_os），侧栏不再重复
+        L.append(f"<div style='margin:2px 0 6px 0;'>{Y}启动模式{E} {fw_txt}"
                  + (f"　{sb_txt}" if sb_txt else "") + "</div>")
         L.append(f"<div style='margin-bottom:6px;'>{Y}主　　板{E} {self._short_model(g('mb'), 24)}</div>")
         cpu_name = (g('cpu') or self.hw.cpu_name or "—").strip()
@@ -1201,8 +1229,14 @@ class MainWindow(QMainWindow):
         return "".join(L)
 
     def _update_sysinfo(self):
-        # v18.2 节流：QTextBrowser.setHtml 是整篇富文本重解析+重排版，每 2s 一次会拖累 UI；
-        # 改为约 6s 刷新一次，并保持滚动位置不被重置。
+        # v18.33 标题后的运行时间标签每拍都更新（QLabel.setText 开销极小），
+        # 侧栏富文本仍按 v18.2 节流约 6s 刷一次。
+        up_lbl = getattr(self, "_hdr_uptime", None)
+        if up_lbl is not None:
+            try:
+                up_lbl.setText(self._uptime_line())
+            except Exception:
+                pass
         self._sys_tick = getattr(self, "_sys_tick", 0) + 1
         if self._sys_tick % 3 != 1:
             return
@@ -1277,6 +1311,7 @@ class MainWindow(QMainWindow):
         if static:
             self._sys_static = static
             self._clear_degraded("sysinfo")
+        self._refresh_header_static()   # v18.33 重检测后同步标题 OS 文本
         self._sys_tick = 0            # 强制下一次刷新立即重绘
         self._update_sysinfo()
 
@@ -3197,6 +3232,17 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         """
         d = QDialog(self); d.setWindowTitle("功耗曲线详情（近 60 分钟）"); d.setStyleSheet(CSS)
         d.resize(1020, 600)
+        # v18.33 双击进入详情时主界面自动隐藏（详情独占屏幕），
+        # 关闭详情后 _show_window() 恢复主界面——避免遮挡，也不存在"关了详情
+        # 主界面沉到别的窗口后面找不回"的问题（主窗口是 Tool 型，无任务栏按钮）。
+        self.hide()
+
+        def _exec_restore():
+            try:
+                d.exec()
+            finally:
+                self._show_window()
+
         vl = QVBoxLayout(d); vl.setContentsMargins(16, 14, 16, 14); vl.setSpacing(10)
 
         pts = list(getattr(self, "_chart_pts", None) or [])
@@ -3206,7 +3252,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
             tip.setWordWrap(True); tip.setStyleSheet("font-size:13px;color:#6b7488;")
             vl.addWidget(tip)
             ok = QPushButton("关闭"); ok.clicked.connect(d.accept); vl.addWidget(ok)
-            d.exec(); return
+            _exec_restore(); return
 
         # 统计摘要
         walls = [wv for _ts, wv in pts if wv > 0]
@@ -3309,7 +3355,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         hint.setStyleSheet("font-size:12px;color:#8a93a6;")
         vl.addWidget(hint)
         ok = QPushButton("关闭"); ok.clicked.connect(d.accept); vl.addWidget(ok)
-        d.exec()
+        _exec_restore()
 
     def open_hourly(self):
         """用电时段分布：按一天 0–23 时展示平均插座功耗，柱按峰谷时段着色，定位高耗时段。"""
