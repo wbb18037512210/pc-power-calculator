@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import re
 import sys
@@ -186,7 +187,7 @@ def _parse_lhm_json(text: str):
     except Exception:
         return [], {}, False
     fans = []
-    cands = {"cpu": [], "memory": [], "motherboard": []}
+    cands = {"cpu": [], "memory": [], "motherboard": [], "gpu": []}
 
     def _val(node):
         try:
@@ -202,6 +203,8 @@ def _parse_lhm_json(text: str):
             kind = "board"
         elif hwid.startswith("/ram"):
             kind = "ram"
+        elif hwid.startswith("/gpu"):
+            kind = "gpu"
         tp = node.get("Type") or ""
         if tp in ("Temperature", "Fan"):
             v = _val(node)
@@ -224,6 +227,11 @@ def _parse_lhm_json(text: str):
                         else:
                             prio = 3
                         cands["cpu"].append((prio, v))
+                    elif kind == "gpu":
+                        # 与 LHM 面板一致：主温度取 GPU Core，其次 Hot Spot
+                        gl = name.lower()
+                        prio = 0 if "core" in gl else (1 if "hot" in gl else 2)
+                        cands["gpu"].append((prio, v))
                     elif kind == "board":
                         cands["motherboard"].append((0, v))
                     elif kind == "ram":
@@ -237,7 +245,110 @@ def _parse_lhm_json(text: str):
         if lst:
             lst.sort(key=lambda x: x[0])
             temps[key] = round(lst[0][1], 1)
+    # v18.37 同时缓存完整传感器树（供 UI 按 LHM 的分组/命名展示原始读数）
+    try:
+        _LHM_SENS.update(groups=_build_lhm_tree(data), ts=time.time(), ok=True)
+    except Exception:
+        pass
     return fans, temps, True
+
+
+# ---------------------------------------------------------------------------
+# v18.37 LHM 完整传感器快照 —— 让 UI 能「以 LibreHardwareMonitor 为参考」显示
+# 温度/转速：分组、命名、Min/Value/Max 全部照搬 LHM 的 Web Server 输出。
+# ---------------------------------------------------------------------------
+_LHM_SENS = {"ts": 0.0, "ok": False, "groups": []}
+
+
+def _build_lhm_tree(root) -> list:
+    """把 LHM /data.json 还原成与它界面一致的「硬件 → 传感器」两级结构。
+
+    硬件节点  = 带 HardwareId（如 /amdcpu/0、/lpc/nct6793d/0、/gpu-nvidia/0）
+    传感器节点 = 带 SensorId（Text/Min/Value/Max 均带单位，原样保留）
+    """
+    groups = []
+
+    def visit(node, cur, parent=""):
+        hwid = node.get("HardwareId")
+        sid = node.get("SensorId")
+        if hwid:
+            cur = {"name": str(node.get("Text") or ""), "hwid": str(hwid),
+                   "parent": parent, "sensors": []}
+            groups.append(cur)
+            parent = str(node.get("Text") or "")
+        elif cur is not None and (sid or node.get("Type")):
+            # 真实 LHM 有 SensorId；单元测试的简化样例只有 Type，两者都要认
+            cur["sensors"].append({
+                "name": str(node.get("Text") or ""),
+                "type": str(node.get("Type") or ""),
+                "min": str(node.get("Min") or ""),
+                "value": str(node.get("Value") or ""),
+                "max": str(node.get("Max") or ""),
+                "sid": str(sid),
+            })
+        for c in node.get("Children") or []:
+            visit(c, cur, parent)
+
+    visit(root, None)
+    return groups
+
+
+def lhm_sensors(force: bool = False) -> dict:
+    """返回 {"ok", "ts", "groups"}：与 LHM 面板同构的全部传感器（含 Min/Max）。
+
+    force=True 会立即重新拉一次 /data.json（普通采样有 10s 缓存）。
+    """
+    if force or not _LHM_SENS.get("groups"):
+        sensor_snapshot_cached(force=True)
+    return dict(_LHM_SENS)
+
+
+# 硬件 HardwareId 前缀 → 部件类别
+_LHM_KIND_PREFIX = (
+    ("/amdcpu", "cpu"), ("/intelcpu", "cpu"),
+    ("/lpc", "motherboard"), ("/motherboard", "motherboard"),
+    ("/ram", "memory"),
+    ("/gpu", "gpu"),
+    ("/nvme", "disk"), ("/hdd", "disk"),
+)
+
+
+def lhm_probe(kind: str):
+    """取 LHM 中某类部件的全部温度/转速读数（只读缓存，不触发网络）。
+
+    kind: cpu | motherboard | memory | gpu | disk | fan
+      fan → 所有当前转速 > 0 的风扇（含显卡风扇）
+      其余 → 对应硬件分组下的 Temperature（5–100°C 过滤 SuperIO 坏通道）
+    返回 [("硬件名 · 传感器名", "原始值文本"), ...]，顺序与 LHM 面板一致。
+    """
+    out = []
+    for g in _LHM_SENS.get("groups") or []:
+        hwid = g.get("hwid") or ""
+        kind_of = ""
+        for pfx, k in _LHM_KIND_PREFIX:
+            if hwid.startswith(pfx):
+                kind_of = k
+                break
+        for sn in g.get("sensors") or []:
+            tp = sn.get("type")
+            try:
+                v = float((sn.get("value") or "").split()[0])
+            except (ValueError, IndexError):
+                continue
+            if kind == "fan":
+                if tp != "Fan" or v <= 0:
+                    continue
+            else:
+                if tp != "Temperature" or kind_of != kind:
+                    continue
+                if not (5.0 <= v <= 100.0):
+                    continue
+                _n = (sn.get("name") or "").lower()
+                if "warning" in _n or "critical" in _n:
+                    continue   # NVMe 的告警/临界阈值，不是实测温度
+            out.append((f"{g.get('name')} · {sn.get('name')}",
+                        sn.get("value") or ""))
+    return out
 
 
 _LHM_EXE = r"D:\tools\LibreHardwareMonitor\LibreHardwareMonitor.exe"

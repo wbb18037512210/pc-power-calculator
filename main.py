@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.36"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.37"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -466,7 +466,8 @@ class MiniOverlay(QWidget):
                 pass
 
     def _bd_row(self, name: str, watts: float, total: bool = False,
-                util_text: str = None, temp_text: str = None):
+                util_text: str = None, temp_text: str = None,
+                temp_tip: str = None):
         """v18.36 四列票据行：部件 | 使用率 | 功耗 W | 温度/转速。
 
         温度列带 °（如 79°）= 温度、纯数字（如 1948）= 风扇转速。
@@ -496,14 +497,19 @@ class MiniOverlay(QWidget):
         lay.addWidget(_lbl(name, c_name, bold=total), 1)
         lay.addWidget(_lbl(util_text if util_text else "", "#9fb4d8", 34))
         lay.addWidget(_lbl("%.0f W" % watts, c_val, 46, bold=total))
-        lay.addWidget(_lbl(temp_text if temp_text else "", "#9fb4d8", 40))
+        _tl = _lbl(temp_text if temp_text else "", "#9fb4d8", 48)
+        if temp_tip:
+            _tl.setToolTip(temp_tip)
+        lay.addWidget(_tl)
         return row
 
-    def set_breakdown(self, bd: dict, util: dict = None, temps: dict = None):
+    def set_breakdown(self, bd: dict, util: dict = None, temps: dict = None,
+                      temps_tip: dict = None):
         """v18.22 票据式功耗结构，v18.36 扩展四列（+使用率、温度/转速）。
-        util/temps：{部件名: 显示文本}；缺省该列留空。"""
+        util/temps：{部件名: 显示文本}；temps_tip：温度列的 LHM 参考读数提示。"""
         util = util or {}
         temps = temps or {}
+        temps_tip = temps_tip or {}
         try:
             items = sorted(((str(k), float(v)) for k, v in (bd or {}).items()),
                            key=lambda kv: -kv[1])
@@ -518,7 +524,8 @@ class MiniOverlay(QWidget):
         if items:
             for k, v in items:
                 _row = self._bd_row(k, v, util_text=util.get(k),
-                                    temp_text=temps.get(k))
+                                    temp_text=temps.get(k),
+                                    temp_tip=temps_tip.get(k))
                 self.bd_rows.addWidget(_row)
                 self._bd_row_widgets.append(_row)
             _row = self._bd_row("合计", sum(v for _, v in items), total=True)
@@ -1097,6 +1104,8 @@ class MainWindow(QMainWindow):
         # 会透过进度条单元格的透明容器渗出（EXE 冒烟实测 CPU 行出现蓝色大块）
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # v18.37 双击「温度/转速」列 → 打开 LibreHardwareMonitor 传感器详情
+        self.table.cellDoubleClicked.connect(self._on_table_dbl)
         lay.addWidget(self.table, 1)
         # PSU 建议
         self.psu_hint = QLabel("")
@@ -1413,6 +1422,9 @@ class MainWindow(QMainWindow):
         self.btn_settings.clicked.connect(self.open_settings)
         self.btn_apps = QPushButton("软件耗电"); self.btn_apps.setObjectName("ghost")
         self.btn_apps.clicked.connect(self.open_apps)
+        # v18.37 传感器详情（以 LibreHardwareMonitor 为参考的温度/转速对照）
+        self.btn_sensors = QPushButton("传感器"); self.btn_sensors.setObjectName("ghost")
+        self.btn_sensors.clicked.connect(self.open_sensors)
         # v18.35 平铺：9 个按钮一行均分铺满整张卡片（此前 5+4 两行第二行
         # 右侧是空的，用户截图要求把空白平铺掉）。卡片全宽 ~1012px，
         # 9 按钮 × ~105px + 间距刚好放下；列 stretch 均分，窄窗口按比例压缩。
@@ -1421,7 +1433,7 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(8)
         _btns = (self.btn_reset, self.btn_export, self.btn_csv, self.btn_compare,
                  self.btn_history, self.btn_sim, self.btn_hourly, self.btn_apps,
-                 self.btn_settings)
+                 self.btn_sensors, self.btn_settings)
         for _i, _b in enumerate(_btns):
             grid.addWidget(_b, 0, _i)
             grid.setColumnStretch(_i, 1)
@@ -2016,6 +2028,8 @@ class MainWindow(QMainWindow):
             warn, hot = self._TEMP_LIMITS["cpu"]
         elif "GPU" in n:
             t = dyn.get("gpu_temp")
+            if t is None:
+                t = st.get("gpu")          # v18.37 回退 LHM（GPU Core）
             warn, hot = self._TEMP_LIMITS["gpu"]
         elif "内存" in str(name):
             t = st.get("memory")
@@ -2038,6 +2052,141 @@ class MainWindow(QMainWindow):
             QColor("#d99a17") if t < hot else QColor("#d8492f"))
         return f"{t:.0f}°", col
 
+    # v18.37 温度/转速列的「LHM 参考读数」：直接把 LibreHardwareMonitor 面板上
+    # 的原始传感器名与读数列出来（带 Min/Max 之外的当前值），便于逐项核对。
+    # Windows 免驱读不到 SuperIO，LHM 是唯一可信来源，故做显式对照。
+    _LHM_PART_KIND = (("CPU", "cpu"), ("GPU", "gpu"), ("内存", "memory"),
+                      ("主板", "motherboard"), ("芯片", "motherboard"),
+                      ("风扇", "fan"), ("SSD", "disk"), ("HDD", "disk"))
+
+    def _temp_tooltip(self, name):
+        s = str(name)
+        kind = None
+        for kw, k in self._LHM_PART_KIND:
+            if kw in s or kw in s.upper():
+                kind = k
+                break
+        if kind is None:
+            return ""
+        try:
+            rows = H.lhm_probe(kind)
+        except Exception:
+            return ""
+        if not rows:
+            # 用采样线程的 ready 判定（不在此处触发网络，避免卡 UI）：
+            # 缓存尚未填充时 ready 也还没意义，先不提示，等首个采样周期落地。
+            _ok = (getattr(self, "_sys_dyn", None) or {}).get("sensor_ready")
+            if not _ok:
+                return ("未连接到 LibreHardwareMonitor\n"
+                        "温度/转速需经其 Web Server（127.0.0.1:8085）读取\n"
+                        "（Windows 免驱读不到 SuperIO/EC 芯片）")
+            return ("LibreHardwareMonitor 未报告「%s」的温度/转速\n"
+                    "该部件本身通常不带温度探头（属正常现象）" % s)
+        return ("LibreHardwareMonitor 参考读数\n"
+                + "\n".join("• %s：%s" % (a, b) for a, b in rows[:14]))
+
+    def open_sensors(self):
+        """v18.37 传感器详情：照 LHM 的分组方式列出温度/风扇/控制等原始读数。"""
+        TYPES = ("Temperature", "Fan", "Control", "Power", "Clock", "Load")
+        d = QDialog(self)
+        d.setWindowTitle("传感器详情 · LibreHardwareMonitor")
+        d.resize(760, 580)
+        vl = QVBoxLayout(d)
+        tip = QLabel()
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#5a6478;font-size:12px;")
+        vl.addWidget(tip)
+        tree = QTableWidget(0, 4)
+        tree.setHorizontalHeaderLabels(["传感器", "最小", "当前", "最大"])
+        tree.verticalHeader().hide()
+        tree.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tree.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        _hh = tree.horizontalHeader()
+        _hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for _i in (1, 2, 3):
+            _hh.setSectionResizeMode(_i, QHeaderView.ResizeToContents)
+        vl.addWidget(tree, 1)
+
+        def _fill():
+            try:
+                snap = H.lhm_sensors(force=True)
+            except Exception:
+                snap = {"ok": False, "groups": []}
+            tree.setRowCount(0)
+            n = 0
+            for g in snap.get("groups") or []:
+                ss = [x for x in (g.get("sensors") or []) if x.get("type") in TYPES]
+                if not ss:
+                    continue
+                r = tree.rowCount()
+                tree.insertRow(r)
+                _p = str(g.get("parent") or "")
+                _title = (f"{_p} › {g.get('name')}" if _p and _p != g.get("name")
+                          else str(g.get("name") or ""))
+                h = QTableWidgetItem(_title)
+                f = h.font()
+                f.setBold(True)
+                h.setFont(f)
+                h.setBackground(QBrush(QColor("#eef1f7")))
+                tree.setItem(r, 0, h)
+                tree.setSpan(r, 0, 1, 4)
+                for x in ss:
+                    r = tree.rowCount()
+                    tree.insertRow(r)
+                    _nm = str(x.get("name") or "")
+                    _val = str(x.get("value") or "")
+                    _bad = False
+                    try:
+                        _fv = float(_val.split()[0])
+                        if x.get("type") == "Temperature":
+                            _bad = not (5.0 <= _fv <= 100.0)
+                        elif x.get("type") == "Fan":
+                            _bad = _fv <= 0
+                    except (ValueError, IndexError):
+                        pass
+                    _it = QTableWidgetItem("    " + _nm + ("（未接线）" if _bad else ""))
+                    tree.setItem(r, 0, _it)
+                    tree.setItem(r, 1, QTableWidgetItem(str(x.get("min") or "")))
+                    _v = QTableWidgetItem(_val)
+                    _vf = _v.font()
+                    _vf.setBold(True)
+                    _v.setFont(_vf)
+                    tree.setItem(r, 2, _v)
+                    tree.setItem(r, 3, QTableWidgetItem(str(x.get("max") or "")))
+                    if _bad:   # LHM 面板对未接线的通道同样是灰色显示
+                        _gray = QBrush(QColor("#9aa3b2"))
+                        for _c in (0, 1, 2, 3):
+                            tree.item(r, _c).setForeground(_gray)
+                    n += 1
+            if n:
+                tip.setText("数据源：LibreHardwareMonitor Web Server（127.0.0.1:8085）。"
+                            "分组、命名与「最小 / 当前 / 最大」三列与其界面一致。"
+                            "灰色分组行 = 该硬件（LHM 中的节点名）。")
+            else:
+                tip.setText("未读取到 LibreHardwareMonitor 数据。请确认 "
+                            "D:\\tools\\LibreHardwareMonitor\\LibreHardwareMonitor.exe 已运行，"
+                            "并已开启 Web Server（选项 → Web Server → 端口 8085、Run）。")
+
+        _fill()
+        bar = QHBoxLayout()
+        btn_ref = QPushButton("刷新")
+        btn_ref.setObjectName("ghost")
+        btn_close = QPushButton("关闭")
+        btn_close.setObjectName("ghost")
+        btn_ref.clicked.connect(_fill)
+        btn_close.clicked.connect(d.accept)
+        bar.addStretch(1)
+        bar.addWidget(btn_ref)
+        bar.addWidget(btn_close)
+        vl.addLayout(bar)
+        d.exec()
+
+    def _on_table_dbl(self, r, c):
+        """双击构成表「温度/转速」列 → 打开 LHM 传感器详情对照。"""
+        if c == 3:
+            self.open_sensors()
+
     def _refresh_breakdown(self):
         bd = self.cur.get("breakdown", {})
         keys = self._sorted_bd_keys(list(bd.keys()))
@@ -2050,6 +2199,7 @@ class MainWindow(QMainWindow):
                 txt, col = self._temp_text_color(name)
                 ti.setText(txt)
                 ti.setForeground(col if col is not None else self._bd_temp_gray)
+                ti.setToolTip(self._temp_tooltip(name))
             return
         self.table.setRowCount(0)
         self._bd_val_items = []
@@ -2068,6 +2218,7 @@ class MainWindow(QMainWindow):
             txt, col = self._temp_text_color(name)
             ti = QTableWidgetItem(txt)
             ti.setForeground(col if col is not None else self._bd_temp_gray)
+            ti.setToolTip(self._temp_tooltip(name))
             self.table.setItem(r, 3, ti)
             self._bd_val_items.append(vi)
             self._bd_util_bars.append(cell)
@@ -3730,13 +3881,14 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         # v18.17 第四行：功耗构成；v18.36 四列（+使用率、温度/转速）
         try:
             _bd = (self.cur or {}).get("breakdown") or {}
-            _util, _temp = {}, {}
+            _util, _temp, _tip = {}, {}, {}
             for _k in _bd:
                 _p = self._util_pct(_k)
                 _util[_k] = f"{_p:.0f}%" if _p is not None else "—"
                 _t, _c = self._temp_text_color(_k)
                 _temp[_k] = _t
-            m.set_breakdown(_bd, _util, _temp)
+                _tip[_k] = self._temp_tooltip(_k)
+            m.set_breakdown(_bd, _util, _temp, _tip)
         except Exception:
             pass
         # v18.19 右上角配置信息（硬件概要，取自启动时检测的本机配置）

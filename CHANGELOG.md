@@ -5,6 +5,36 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.37 — 温度/转速以 LibreHardwareMonitor 为参考显示 + 修 ensure_lhm 崩溃
+
+### 以 LHM 为参考显示温度/转速
+- 新增**传感器详情**窗口（控制条「传感器」按钮 / 双击构成表「温度·转速」列）：
+  按 LHM 的硬件分组列出全部温度、风扇、风扇控制、功耗、频率、占用读数，
+  列结构与 LHM 面板一致 —— 传感器 | 最小 | 当前 | 最大；分组标题保留层级
+  （如 `B450M-PLUS › Nuvoton NCT6793D`），带「刷新」按钮。
+- 构成表与悬浮窗的温度/转速列新增 **LHM 参考读数 tooltip**：逐项列出原始
+  传感器名与读数（例：`AMD Ryzen 5 5600X · Core (Tctl/Tdie)：72.3 °C`），
+  可直接和 LHM 面板对表；风扇行列出每一路在转的风扇（含显卡风扇）。
+- 语义温度新增 **GPU**：与 LHM 面板一致取 `GPU Core` 优先于 `GPU Hot Spot`；
+  nvidia-smi 取不到时回退 LHM。磁盘参考读数过滤 NVMe 的告警/临界阈值
+  （那是阈值不是实测温度，此前会混进列表造成误读）。
+
+### 修复（v18.36 遗留真实 bug）
+- **`hardware.py` 用了 `os.path.exists` 却从未 `import os`**：LHM Web Server
+  一断（进程被关/开机未自启），`ensure_lhm()` 立即抛 NameError，
+  且它位于 `_query_sensors` 的 try 之外 → 整个采样链路抛异常。
+  这正是"温度/转速时好时坏"的隐藏原因。已补 `import os` 并加回归断言。
+
+### 其他
+- 控制条按钮 9 → 10（新增「传感器」），仍一行平铺均分。
+- 悬浮窗温度列宽 40 → 48px，避免 `1942 RPM` 被截断。
+- 单测 `tests/test_hw_detect.py` +13 项（LHM 树/父层级/probe 各部件/阈值过滤
+  /GPU 语义温度/os 回归），本机 72 项全通过；`test_headless.py` 全通过。
+- 本机实测对照：CPU 72.3°（Tctl/Tdie）、主板 27.0°（SuperIO #1）、
+  GPU 41.0°（Core）、风扇 1951 RPM（机箱）+ 1209 RPM（显卡）。
+
+---
+
 ## v18.36 — 真实温度/风扇数据源(LHM Web Server) + 悬浮窗构成四列 + 迷你进度条
 
 ### 数据源：接入 LibreHardwareMonitor Web Server
