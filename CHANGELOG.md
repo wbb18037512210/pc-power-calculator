@@ -5,6 +5,31 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.40 — 借鉴 WinosInfo 的内存硬件信息展示
+
+### 内存温度：已确认 WinosInfo 也读不到
+- 用户提供了 `显示硬件信息工具_WinosInfo_2024112615_x86.exe` 作为参考。
+  经实际运行+截图分析，WinosInfo 同样**不显示内存温度**——其内存区域只有
+  容量、插槽数、最大支持、DIMM 型号/频率，没有温度读数。
+- 这说明本机（B450M-PLUS + Micron MTA8ATF2G64HZ-3G2E1 / XJC PC4-25600-1.2V
+  两条 DDR4）硬件上确实没有 SPD 温度探头，连 WinRing0 ring-0 驱动也读不到。
+  内存温度问题已定性为硬件限制。
+
+### 能借鉴的：更完整的 DIMM 静态信息
+- 主界面硬件信息区（实时卡片左列）的内存区块升级为 4 行：
+  1. **物理内存 X.XXGB （N插槽 · 最大支持 XGB）**
+  2. **已用 X.XXGB · 可用 X.XXGB · 占用 X%**
+  3. **内存条 厂商 料号 容量G · 厂商 料号 容量G DDR4/频率**
+  4. **内存温度：无探头（本机内存无SPD温度传感器）**（灰色）
+- 数据来自已有的 `Win32_PhysicalMemory` / `Win32_PhysicalMemoryArray` 采集
+  （ slots、maxcap、PartNumber、ConfiguredClockSpeed 等字段此前已采集但未展示）。
+- 当内存温度可读时（DDR5/带探头的 DDR4），第 4 行自动切换为彩色温度显示。
+
+### 其他
+- 单测 75 项全过；`test_headless.py` 全过。
+
+---
+
 ## v18.39 — 内存温度「无探头」明示（不再显示像坏掉的「—」）
 
 ### 内存温度为什么还是不显示（结论先行）

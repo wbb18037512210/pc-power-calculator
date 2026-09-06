@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.39"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.40"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -1249,17 +1249,33 @@ class MainWindow(QMainWindow):
         LA.append(f"<div style='{SUB}margin-bottom:3px;'>{g('cores') or '—'}核"
                   f"{g('threads') or '—'}线程 · {mhz / 1000.0:.2f}GHz · "
                   f"{self._temp_html(cpu_t, 75, 85)}</div>")
-        LA.append(f"<div style='margin-bottom:1px;'>{Y}物理内存{E} {gb(ram_total)}</div>")
-        LA.append(f"<div style='{SUB}margin-bottom:3px;'>已用 {gb(ram_used)} · 可用 {gb(ram_free)}</div>")
+        # v18.40 借鉴 WinosInfo 的内存信息展示：插槽数、最大支持、PartNumber、
+        # 占用率、以及明确的「内存温度：无探头」说明（本机内存无 SPD 温度传感器）。
+        slots = g('slots') or '—'
+        maxcap_bytes = g('maxcap') or 0
+        maxcap_txt = f"{maxcap_bytes / (1 << 30):.0f}GB" if maxcap_bytes else '—'
+        LA.append(f"<div style='margin-bottom:1px;'>{Y}物理内存{E} {gb(ram_total)} "
+                  f"<span style='font-size:11px;color:#777;'>（{slots}插槽 · 最大{maxcap_txt}）</span></div>")
+        LA.append(f"<div style='{SUB}margin-bottom:3px;'>已用 {gb(ram_used)} · 可用 {gb(ram_free)} · "
+                  f"占用 {ram_pct:.0f}%</div>")
         mods = (s.get("mods") or [])[:4]
         if mods:
-            _parts = []
+            _mparts = []
             for m in mods:
                 mn = (m.get("m") or "").replace("Unknown", "GeIL").split()[0] if (m.get("m") or "") else "—"
+                pn = (m.get("pn") or "").strip()
                 cap = int(m.get("cap") or 0) / (1 << 30)
-                _parts.append(f"{mn} {cap:.0f}G")
-            LA.append(f"<div style='{SUB}margin-bottom:3px;'>内存条 {' · '.join(_parts)}"
-                      f" DDR4/{mods[0].get('clk') or mods[0].get('spd') or '—'}</div>")
+                spd = m.get('clk') or m.get('spd') or '—'
+                pn_short = (pn[:14] + '…') if len(pn) > 15 else pn
+                _mparts.append(f"{mn} {pn_short} {cap:.0f}G")
+            LA.append(f"<div style='{SUB}margin-bottom:3px;'>内存条 {' · '.join(_mparts)} DDR4/{spd}</div>")
+        mem_t = st.get("memory")
+        if mem_t is None:
+            LA.append(f"<div style='{SUB}color:#9aa3b2;margin-bottom:3px;'>"
+                      f"内存温度：无探头（本机内存无SPD温度传感器）</div>")
+        else:
+            LA.append(f"<div style='{SUB}margin-bottom:3px;'>"
+                      f"内存温度：{self._temp_html(mem_t, 50, 60)}</div>")
         # v18.35 网络（含 IP/速率）紧跟物理内存/内存条之后（用户指定位置），
         # 左列顺序：启动模式 → 主板 → 处理器 → 内存 → 网络；右列：显卡 → 磁盘。
         nic = g('nic')
