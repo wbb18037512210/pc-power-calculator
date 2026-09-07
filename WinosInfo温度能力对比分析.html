@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="i2ypacO3LJlisVx4YaMSpC">
+<head data-page-node-id="aOo8EbP5qk57QYWUeA8U0Y">
+<meta charset="UTF-8" data-page-node-id="10YgsJgUl7nKTDzQxzn04x">
+<title>WinosInfo 温度能力对比分析</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif;background:#f6f8fb;color:#1a1a1a;max-width:900px;margin:24px auto;padding:24px;line-height:1.6}
+h1{font-size:22px;border-bottom:2px solid #2b6cb0;padding-bottom:8px;margin-bottom:18px}
+h2{font-size:16px;color:#2b6cb0;margin-top:24px}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin:12px 0;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.ok{color:#276749}.warn{color:#c05621}.bad{color:#c53030}.gray{color:#718096}
+table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13px}
+th,td{border:1px solid #e2e8f0;padding:6px 10px;text-align:left}
+th{background:#edf2f7}
+code{background:#edf2f7;padding:2px 6px;border-radius:4px;font-size:12px}
+pre{background:#1a202c;color:#e2e8f0;padding:12px;border-radius:6px;overflow:auto;font-size:12px}
+</style>
+</head>
+<body data-page-node-id="NZQh6eTPkKVCLATLZxaBfp">
+<h1 data-page-node-id="bBjCKnRViCBQbDTs4eQEmT">WinosInfo 温度识别能力对比分析</h1>
+
+<div class="card" data-page-node-id="InQyeq1az2noNzdYaGKiP8">
+<p data-page-node-id="tEbf0rP5ZsHWdwhscX9sxU"><strong data-page-node-id="R9UBpc4l5ikr11QEUGtUkW">结论先行：</strong>WinosInfo 在本机的温度识别能力并不强于 LibreHardwareMonitor；
+内存温度无法显示的根本原因是<strong data-page-node-id="MF4ZRCier5WQJe2KRDBxpQ">内存条本身没有 SPD 温度传感器</strong>，属于硬件限制，任何软件（包括 WinosInfo、HWiNFO、AIDA64）都无法凭空读出。</p>
+</div>
+
+<h2 data-page-node-id="MKVMMo3R0wXD0RIqtqs0bB">1. 本机实际可用的温度传感器（LibreHardwareMonitor /data.json）</h2>
+<div class="card" data-page-node-id="bUkWLl99bxOucdP6G7HyGf">
+<p data-page-node-id="BADp2YmlAoF7oJlYZk7Btn">当前通过 LHM Web Server 可枚举到 <strong data-page-node-id="Fvb3JsBwn7Ln71srD8Bywx">16 路温度传感器</strong>，无一路来自 DIMM/内存：</p>
+<table data-page-node-id="OBqDs2C7VgKyGLsseXJ0hm">
+<tr data-page-node-id="ny6qDm3Pn2NO4KBysIGgnA"><th data-page-node-id="KJQ99KnRrpdDu6nwCyTfdv">硬件分组</th><th data-page-node-id="aMfGjJHvXJgmcPRMt07abM">传感器名</th><th data-page-node-id="ntz9DtXPRpS9G5oty195ND">当前值</th><th data-page-node-id="53MLmMFdzl2GBBS3eKRZTM">备注</th></tr>
+<tr data-page-node-id="NaX8rwMNnxiPscHAFlyU9t"><td data-page-node-id="tTEPF8aA0XCjbxlaZymi90">SuperIO (NCT6793D)</td><td data-page-node-id="BZS4GSW6z175XliKtqFgAh">Temperature #1</td><td data-page-node-id="I7UbHoFqeywXgYSBbRytqN">32.5 °C</td><td data-page-node-id="tHFQb2frOZGPlNDvVgnREC">主板区域</td></tr>
+<tr data-page-node-id="9Rfu8lyrFTirwJDvSqnzho"><td data-page-node-id="18hKPZhBaZ2MaZiu8fqKcQ">SuperIO</td><td data-page-node-id="xtpAeundBW5RKRdorpB37b">Temperature #2</td><td data-page-node-id="JeTAe0Fetz3jBBNMOsFbze">29.0 °C</td><td data-page-node-id="J0CBmgDIRzkBaBEOpIgQ15">主板区域</td></tr>
+<tr data-page-node-id="FzO8RpqdhlTSD3ViRYIVVe"><td data-page-node-id="xY3tMn5q3uokyM12Ntz6lP">SuperIO</td><td data-page-node-id="jWv67CXJQ1qkyGyaoaH7eL">Temperature #3</td><td data-page-node-id="UBmncoaRNG5nrpMWALizuN">3.0 °C</td><td data-page-node-id="gACJGKuEkc46Jy2z1ORBqP">通常为空/未用</td></tr>
+<tr data-page-node-id="dNPNXT9rWrg5qLZIrcd56i"><td data-page-node-id="u0BiezQbCjpvXIB1GIFahs">SuperIO</td><td data-page-node-id="V23hEcnZvQHZX7Yt9VqTWS">Temperature #4</td><td data-page-node-id="Wihr9vyRbfTnO90idlxWQS">108.0 °C</td><td class="gray" data-page-node-id="MoVwccHEG0YElzUfvU99DM">未接线/坏通道</td></tr>
+<tr data-page-node-id="XhnBVXSs8lDmcep05n7HFi"><td data-page-node-id="pBGDniy7AHF4S4NXXGnlco">SuperIO</td><td data-page-node-id="bJ7XkvRd26tfuN02tzMfm8">Temperature #5</td><td data-page-node-id="5AIOECe4ojwbwoeepbfcxU">104.0 °C</td><td class="gray" data-page-node-id="uroDvH6HWjCYH1YBiyzHhL">未接线/坏通道</td></tr>
+<tr data-page-node-id="n9DuTspSsbkvkLj4VpQqCa"><td data-page-node-id="eMtsNGfMitAN31UyfN6UiP">SuperIO</td><td data-page-node-id="vRjmRSPHrAQHZvjR0irx4W">Temperature #6</td><td data-page-node-id="fZLtWMsJMDPnVHPesWCkOx">102.0 °C</td><td class="gray" data-page-node-id="DTR6qGqTl8Bdi9DFMYMGPw">未接线/坏通道</td></tr>
+<tr data-page-node-id="Yaaw9zgdMVcTii0uQE3CQA"><td data-page-node-id="CSQc52ogSg3ixa9g1XF1FE">AMD Ryzen 5 5600X</td><td data-page-node-id="fktAImAo6xQj7TxB6I3fiA">Core (Tctl/Tdie)</td><td data-page-node-id="EQuiZnIMgsM1LvkdAIIr8y">81.3 °C</td><td data-page-node-id="uGMB7YpPnjYWikCK2Ia3VO">CPU 主温度</td></tr>
+<tr data-page-node-id="wrH411nVSKNC0r4IgpdOep"><td data-page-node-id="5hJK4KZti5MGdtfLejRYr5">AMD Ryzen 5 5600X</td><td data-page-node-id="EtztZ21GfuvWJZUGLVeSz1">CCD1 (Tdie)</td><td data-page-node-id="Waw1aI3vXe9dBPzKbWzIkl">79.8 °C</td><td data-page-node-id="juYpc7mXIYMKpC0VzQtQzz">CCD1 裸片温度</td></tr>
+<tr data-page-node-id="YNG2FtEwnwvL1HQ34Pjjs8"><td data-page-node-id="TWL8PsckVPfr6uZxFgeyJt">NVIDIA GTX 1080</td><td data-page-node-id="uQTbCu8O7rGkVo8UjFnZQr">GPU Core</td><td data-page-node-id="VffsefEYd5YfLzFJGqyE0L">54.0 °C</td><td data-page-node-id="IrgLxiq0otwHEt1S5nmSkl">GPU 核心</td></tr>
+<tr data-page-node-id="BLP3auHEOnCsykA5zmlQHa"><td data-page-node-id="odDW6H2OYKMz7itjf6NXTc">NVIDIA GTX 1080</td><td data-page-node-id="AmfJxRS5dMwLKNiZRdFqbx">GPU Hot Spot</td><td data-page-node-id="yDyvbyHFWqfRW9U3JOufB6">65.4 °C</td><td data-page-node-id="09GCaGdc9OrF9dJQoBPmG9">GPU 热点</td></tr>
+<tr data-page-node-id="oLGrdHzonUSuZKxejqyqRZ"><td data-page-node-id="wTYS8PLxfE3q1C8MtLBcb7">NVMe SSD</td><td data-page-node-id="PP71nKRcco0G6rFhrDX4a0">Composite Temperature</td><td data-page-node-id="RiQNp7IaONvrDb9lUsVku4">43.0 °C</td><td data-page-node-id="SeuPGZrWre8P3qKb2bNhuW">主控温度</td></tr>
+<tr data-page-node-id="nchQeKexdidwZIiqRw5f8n"><td data-page-node-id="078IctLfzNpLeDPC6h3cQE">NVMe SSD</td><td data-page-node-id="dA2VFBwmRcHw6CTpMHj7vx">Warning Temperature</td><td data-page-node-id="COP8vK2fcb12QQ5dziw8rw">67.0 °C</td><td data-page-node-id="MVrQ7ImqWv1oCjannxPW8r">告警阈值</td></tr>
+<tr data-page-node-id="UFB2hJ35wJ4kkkVlcDjXLE"><td data-page-node-id="RqxdBntHsJDHeg8XZ5oQcc">NVMe SSD</td><td data-page-node-id="gfF96NDG4oFbufxDIsRezZ">Critical Temperature</td><td data-page-node-id="HH8fXtmKDC73HETitaglyp">69.0 °C</td><td data-page-node-id="ORc8UxAACJYVqT3sW01DPl">临界阈值</td></tr>
+<tr data-page-node-id="SgfLUEAAEwEa2lMNp6tLQL"><td data-page-node-id="2BXtA08D1270wJche1Is09">SATA 机械盘 ×3</td><td data-page-node-id="9CsxEoXH0unUEnUAVTZhTE">Temperature</td><td data-page-node-id="2dnsxnDa42WvRI8DMhZXnR">37.0 °C</td><td data-page-node-id="KKDisN2Pyb2U10u9Uvzou9">机械硬盘</td></tr>
+<tr data-page-node-id="EBm37iSzOWr5TVERfu7TFy"><td data-page-node-id="rJPdXnUk9Dhj6NRSt0kZdG">其他</td><td data-page-node-id="EVebR7HgTZdvnyaoK9gYjw">Temperature</td><td data-page-node-id="ausyxneYJ17Hc3SkFnIBwF">0.0 °C</td><td class="gray" data-page-node-id="yfhTEWXA0NWDTCW0lg9qej">未接线</td></tr>
+<tr data-page-node-id="IZQ8THIRP3CIBFN9Eka43F"><td data-page-node-id="HPtnbFOujgSpqlngMjEmSo">其他</td><td data-page-node-id="SOOmSMxxTnWT3OV2oC6Ihi">Temperature</td><td data-page-node-id="L7soozh9hkLnFkxdu2gCSC">0.0 °C</td><td class="gray" data-page-node-id="L1AJLswGGDYaZFeM3fR4uX">未接线</td></tr>
+</table>
+<p class="bad" data-page-node-id="vluroCwMM0UlMhOjb6jxZA"><strong data-page-node-id="T0U5TtGq0tQskXJmEzQdPA">关键发现：16 路温度中没有任何 DIMM / Memory Temperature 条目。</strong></p>
+</div>
+
+<h2 data-page-node-id="6wE4lCcumib7F70NTSlIgv">2. WinosInfo 的软件定位</h2>
+<div class="card" data-page-node-id="CshKsR9VQO74Y2CbDsUx5c">
+<p data-page-node-id="L90GhFEWkXuy80KgwxeBBv">WinosInfo 同目录下的 <code data-page-node-id="0HimnG8Q0QyEAF57ORcfWW">显示硬件信息工具_WinosInfo_2024112615_x86.xml</code> 是其界面颜色/位置配置文件，
+其中声明的显示大类为：</p>
+<pre data-page-node-id="U2ffxCCJczlwX28bBxb5Xl">运行时间、操作系统、启动模式、计算机名、主机序号、主板型号、主板Bios、
+电池信息、处理器、物理内存、图形显示、磁盘信息、网络连接、网络速率</pre>
+<p data-page-node-id="BlAWT1SA13pmWeBhBrbrVK"><strong data-page-node-id="FsAxKVnG1S73gWX9PeZQsy">配置文件中没有任何“温度”或“风扇”独立分类。</strong> WinosInfo 本质上是一款硬件信息展示工具，
+不是专门的传感器/温度监控工具；它的优势在于系统信息归类与配色，而不是温度识别。</p>
+</div>
+
+<h2 data-page-node-id="3XE9aDcKzlLFYGwM2aIodU">3. 与 pc_power_calc 的温度能力对照</h2>
+<div class="card" data-page-node-id="LVbzLXiZkTGjXWOcXcCj25">
+<table data-page-node-id="O2JooXqxQWCeybpvRsI7sK">
+<tr data-page-node-id="q4ibjF94UntJ1l76GXcB9C"><th data-page-node-id="WhqFocLBrDMWr7JSveDelH">项目</th><th data-page-node-id="Ma26ewB194Y4qGeRACE3Q2">pc_power_calc v18.40</th><th data-page-node-id="wcrOI9tqv1UNVBYGkCHqFe">WinosInfo</th></tr>
+<tr data-page-node-id="xXJfQzhutERYf3lBVTM0FB"><td data-page-node-id="3gMSzsvE42GOahITmb7tHW">CPU 温度</td><td class="ok" data-page-node-id="BLLbJLSSqHpkmRo25ANPCP">已支持（LHM CPU Core）</td><td class="ok" data-page-node-id="MMDz4CU5jn2Pra8KNQRvQl">支持</td></tr>
+<tr data-page-node-id="AoCMh1hf4G0Qm90EWLiCzL"><td data-page-node-id="u9KjNj7fN4Y9jCO30k0MeU">GPU 温度</td><td class="ok" data-page-node-id="SEoL2G5WY1V3MLT7A4t1IW">已支持（nvidia-smi / LHM GPU Core）</td><td class="ok" data-page-node-id="mQE3RpG0s9HmDYKm4KtFTe">支持</td></tr>
+<tr data-page-node-id="Q8xYbW6qWlCnMxzJTU9gAv"><td data-page-node-id="CUkM4YBma0DDBIDsdqb681">GPU Hot Spot</td><td class="ok" data-page-node-id="HyTXAJFpGWBx7VQzSL2PE7">已在传感器详情/ tooltip 中列出</td><td data-page-node-id="Sz8em7UoWfwQ4uFIPJ90TA">未知</td></tr>
+<tr data-page-node-id="WyEOgQ18AkAi6RLmcTJsSY"><td data-page-node-id="IBqXMbCggtvsoAMBdvdEiI">NVMe 主控/阈值</td><td class="ok" data-page-node-id="vehFha9mH8UCHl5x9EoYlq">已在传感器详情/ tooltip 中列出</td><td data-page-node-id="lmUF2jl6UTHN49KJNLHBAy">未知</td></tr>
+<tr data-page-node-id="YSx5wLsMjOoboCJ7tIaEK1"><td data-page-node-id="8UbMNOAvfuc8D53UqMTfNR">主板/VRM 温度</td><td class="ok" data-page-node-id="sLIZN3NvRAJwRaN4DGIHTO">已支持（LHM SuperIO）</td><td data-page-node-id="mxNBjZ84X6Dh7iCNwMS2I2">未知</td></tr>
+<tr data-page-node-id="ltbUAcKnXIup81eemKfyV9"><td data-page-node-id="SnEOrD5kk4naaZAKvlTJHP">SATA 硬盘温度</td><td class="ok" data-page-node-id="mztEArcgMOhCmGBF7dEOEa">已支持</td><td data-page-node-id="jGGxuIELVkOWQiW0sVv3xT">未知</td></tr>
+<tr data-page-node-id="SvPQxMQvRLSSz3D7v6QENy"><td data-page-node-id="QBfESMcvJ4idGeyyLmCpSh">风扇转速</td><td class="ok" data-page-node-id="0ri40ittUyNz2k7cvJRBV3">已支持</td><td data-page-node-id="tbLSWIPjt4CwHMSrI6G54z">未配置</td></tr>
+<tr data-page-node-id="w54kP5Cx5w6D73GmljZEoO"><td data-page-node-id="gYA5kmmmKZbFldb2uc1K8Q">内存温度</td><td class="bad" data-page-node-id="7Jh8JBGBDXuoRB8K2X5o7R">本机无探头 → 显示“无探头”</td><td class="bad" data-page-node-id="W5Qq7GrfTIIpHdM1gxCxB3">同样无法读取</td></tr>
+<tr data-page-node-id="Hsh5fHUItNerb5hXiXJxJH"><td data-page-node-id="y2Zy2xH7AuwEGurcqrTd2p">DIMM 静态信息</td><td class="ok" data-page-node-id="vSFWdxTJjuYoRAwEjlV4l5">已借鉴 WinosInfo 补全（插槽/最大支持/PartNumber）</td><td class="ok" data-page-node-id="7f2yERmt9jxHSYPEJA55rT">展示较全</td></tr>
+</table>
+</div>
+
+<h2 data-page-node-id="udytTjCaltvBz3jnEeWgAF">4. 内存温度无法显示的根因</h2>
+<div class="card" data-page-node-id="2f2mXRJraD5SDj1edIqhlX">
+<ul data-page-node-id="lk6XXN2eMgqOEkU9f1qAP8">
+<li data-page-node-id="fPY8GlDDQGmQIeUk7Y0UoU">本机内存条：<code data-page-node-id="2jP1NbCHygOtabsUDLcJUp">Micron MTA8ATF2G64HZ-3G2E1</code>、<code data-page-node-id="Eq4WMThALbevJEouhtMO0h">兴嘉辰 XJC PC4-25600-1.2V</code>。</li>
+<li data-page-node-id="gAOEgKwMgAcKXXknADV77z">两条均为 DDR4，<strong data-page-node-id="9MSqDj0Ee5fL8jcWPZ6O8j">未集成 SPD 温度传感器</strong>。</li>
+<li data-page-node-id="jZ97YKnCogLiyYVXMfXAUv">LHM 能读取该内存的 Capacity、SPD 时序等数据，但没有 Temperature 节点。</li>
+<li data-page-node-id="Sho0oWkDQ2Q734vEE6HgUh">WinosInfo 在上次实测中，内存区域同样只展示容量/插槽/最大支持/型号，<strong data-page-node-id="GXp5WT9JfJAl3ZRt7AHlQU">没有任何温度读数</strong>。</li>
+<li data-page-node-id="1qrr6QBJPBaFlPVd02HdYC">这是硬件限制，换用 ring-0 驱动也无法突破；只有 DDR5 或部分高端 DDR4 才带有 SPD 温度探头。</li>
+</ul>
+</div>
+
+<h2 data-page-node-id="A9xC9c2jAyDbOaRQ9b4lVK">5. 可“借鉴”的落点</h2>
+<div class="card" data-page-node-id="tWhAd2JQT1pqhXQNlJCkvG">
+<p data-page-node-id="SAG6UuKG1OA0hNqmArzZB4">由于温度数据来源与 LHM 相同，WinosInfo 并不能提供额外的温度通道。可借鉴的主要是<strong data-page-node-id="ee05Mu8y1JgvE3mHg8dOLr">界面组织方式</strong>：</p>
+<ol data-page-node-id="jCXOipySqtBLhMrA3JbFqC">
+<li data-page-node-id="Ld3IhIEwANqtydJlgLpNCM"><strong data-page-node-id="r78trMb3y5Tr6oDcpuJnCj">彩色分类头</strong>：传感器详情窗口可像 WinosInfo 一样按硬件分组并加上醒目的分类色（如 CPU 蓝、GPU 绿、主板灰）。</li>
+<li data-page-node-id="RZ0FFlxNyWOVHNfMRvG6dS"><strong data-page-node-id="3Em8YtWsvPLs0q9OpR49Z0">全部温度一览</strong>：在主界面增加一个折叠/弹出的「全部温度」面板，把 LHM 已能读到的 16 路温度一次展示出来，减少用户去 sensor details 窗口翻找的步骤。</li>
+<li data-page-node-id="uSGWVbywbR7m3hQ3inT1qB"><strong data-page-node-id="VpMHc3Z6NeABSGlXe6ATNO">状态说明文案</strong>：把“无探头”的判断逻辑复用到其他无传感器部件，统一用灰色文字+ tooltip 说明，避免用户误以为是 bug。</li>
+</ol>
+<p data-page-node-id="UVMB2XZFvwoJ0HuKBOCtHg">但<strong data-page-node-id="q54AHwE5TivjmFAR8uudnG">无法借鉴出内存温度</strong>，因为硬件本身没有对应探头。</p>
+</div>
+
+<h2 data-page-node-id="0aPMMfKTMLdjWiCjEsHGnf">6. 建议</h2>
+<div class="card" data-page-node-id="RZDLC6SLQS7BOC8NwGhuB0">
+<ul data-page-node-id="u1DyQyFKA6NbfK7vQpicKR">
+<li data-page-node-id="diiVmmHoJNIGezgupA2wif"><strong data-page-node-id="vUnjGzmWfF3s5IK2qWrk1x">短期</strong>：保持现状，内存区继续显示“无探头”；若用户换 DDR5，代码会自动显示真实温度，无需改动。</li>
+<li data-page-node-id="NIMnVgsYjT3UH8YxG7VuyE"><strong data-page-node-id="2GRjo7fogcIduZij8keFWi">可选增强</strong>：在主界面新增「全部温度」折叠卡片，列出 CPU/GPU/NVMe/主板/SATA 全部可用温度，参考 WinosInfo 的信息分组风格。</li>
+<li data-page-node-id="75EnlL9QRlfVr6d7Zkju5J"><strong data-page-node-id="YOVDGc0HwCASQtoMfp20Wj">不建议</strong>：尝试绕过 Windows 去读取不存在的 SPD 温度传感器，属于无效方向。</li>
+</ul>
+</div>
+
+<p style="margin-top:30px;color:#718096;font-size:12px" data-page-node-id="kVzav0JtK4gaQnEtIytZlW">生成时间：2026-09-06 21:52 · 数据来源：LibreHardwareMonitor v0.9.6 /data.json、WinosInfo XML 配置</p>
+</body>
+</html>

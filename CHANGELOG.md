@@ -5,6 +5,104 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.43 — 温度读取全面切回 LibreHardwareMonitor（内置 bundle + 自启动 Web Server）
+
+### 背景：v18.42 的「驱动无关」方案覆盖不足
+- v18.42 改用 WMI + nvidia-smi 后，实测只剩 GPU 与磁盘温度可读：CPU / 主板 SuperIO /
+  NVMe / 风扇转速 WMI 一律不暴露（本机 Win32_Fan、Win32_TemperatureProbe、
+  MSAcpi_ThermalZoneTemperature 全为空）。
+- 用户明确要求「自己一定把所有能读取温度的全部更换」→ v18.43 把所有温度源统一收回
+  LibreHardwareMonitor，并随程序内置（`lhm_bin/`），不再依赖用户另行安装。
+
+### 根因：LHM 的配置文件名踩坑（本次真正的 bug）
+- `MainForm.cs:75`：`_settings.Load(Path.ChangeExtension(Application.ExecutablePath, ".config"))`。
+  对 `LibreHardwareMonitor.exe` 做 ChangeExtension 得到的是
+  **`LibreHardwareMonitor.config`**，而**不是** `LibreHardwareMonitor.exe.config`。
+- `.exe.config` 只服务于 CLR 的程序集绑定（bindingRedirect），LHM 自己的
+  `PersistentSettings` 根本不读它。此前把 `runWebServerMenuItem=true` 注入该文件，
+  结果是 8085 端口永不监听、且**没有任何报错**。
+- 顺带确认机制：`UserOption.Changed` 的 `add` 访问器会**立即 invoke** 一次
+  （`UserOption.cs:57`），所以配置写对后进程启动即自动 `StartHttpListener()`，
+  既不需要 GUI 勾选，也不需要 netsh urlacl 预留。
+
+### 改动
+- `hardware.py`：新增 `_lhm_bin_dir()` / `_lhm_fetch()` / `is_lhm_running()` /
+  `ensure_lhm()`；`sensor_snapshot_cached()` 改为从 `/data.json` 取数，取不到时自动
+  隐藏拉起内置 LHM（SW_HIDE + CREATE_NO_WINDOW，无窗口、无控制台闪现）。
+  移除 `_driverfree_collect()` / `_build_driverfree_groups()` 与 `local_temp_monitor` 依赖。
+- 冷启动修正：新拉起的实例在首个响应后再等 1.5s（`_LHM_WARMUP`）。少了这一步时首帧
+  磁盘温度只有 1/4 —— Web Server 虽已响应，HDD / NVMe 的 Value 还需约 0.5s 才填上。
+- `main.py`：全部 UI 文案改回 LibreHardwareMonitor（构成表 tooltip、`open_sensors`
+  窗口标题与数据源说明、GPU 占用来源标注、风扇数据源注释）；版本号 v18.42 → v18.43。
+- `build_v1837.py`：新增 `prepare_lhm()`，把 `lhm_bin/` 精简出 `lhm_pack/`
+  （剔除 .pdb / .xml / .bak / lhm.zip 共约 7.8MB，19MB → 11MB），并**每次构建重写**
+  `LibreHardwareMonitor.config` 以确保 Web Server 开关正确；以
+  `--add-data lhm_pack;lhm_bin` 打进 exe；移除 `--hidden-import local_temp_monitor`。
+- 说明：`local_temp_monitor.py` 保留在项目中作参考，但已不参与运行、不进源码白名单。
+
+### 实测（本机 Ryzen 5 5600X + GTX 1080 + Nuvoton NCT6793D）
+- 16 路温度可读：CPU Core(Tctl/Tdie) 71.6°C / CCD1 63.3°C、GPU Core 41.0°C /
+  Hot Spot 52.8°C、主板 SuperIO #1 28.0°C / #2 31.0°C、NVMe Composite 39.0°C、
+  3 块 HDD 37°C；风扇 2 路（Fan #1 1948 RPM、GPU 1199 RPM）。
+- SuperIO 未接线的脏通道（3.0 / 110 / 106 / 104°C）由既有 5–100°C 过滤剔除。
+- 内存 0 项属硬件限制（本机内存条无 SPD 温度探头），UI 明示「无探头」。
+- 测试：`tests/` 22 项全过；`test_headless.py` HEADLESS_OK。
+
+---
+
+## v18.42 — 温度读取改用驱动无关方案（WMI + nvidia-smi），完全移除 LibreHardwareMonitor 依赖
+
+### 背景：用户要求「温度读取用 local_temp_monitor.py 这个源码，完全替换 LHM」
+- `local_temp_monitor.py` 是**驱动无关 / driver-free** 方案：仅用 Windows 自带 WMI
+  （Win32_Processor / Win32_VideoController / MSAcpi_ThermalZoneTemperature /
+  Win32_TemperatureProbe）+ 系统已装 NVIDIA 驱动的 `nvidia-smi`，**不加载任何内核驱动**。
+- 取舍（用户已知并接受）：本机 WMI 不暴露 CPU/主板/内存/NVMe/风扇温度，故这些项
+  显示「— / 无探头」；仅 NVIDIA GPU 经 nvidia-smi 提供真实温度，磁盘经
+  StorageReliabilityCounter 提供温度。
+
+### 改动
+- `hardware.py`：`sensor_snapshot_cached()` 改为调用 `_driverfree_collect()`
+  （`import local_temp_monitor` → `collect_all()`），结果经 `_build_driverfree_groups()`
+  填进既有 `_LHM_SENS` 缓存；`lhm_sensors` / `lhm_probe` / `lhm_gpu_load` 解析逻辑不变
+  （测试直接操作 `_LHM_SENS`，故仅换数据源、不动解析）。
+- 移除 `ensure_lhm()` / `_query_sensors()` / `_LHM_EXE` 等 LHM 专用代码与 Web Server 依赖。
+- `main.py`：UI 文案由 LibreHardwareMonitor 改为「驱动无关（WMI + nvidia-smi）」；
+  `open_sensors` 窗口标题/source tip、tooltip、GPU 占用来源标注同步；`_kind_of` 增加
+  `/acpi`、`/probe` → board 分类；版本号 v18.41 → v18.42。
+- 打包：`build_v1837.py` 增加 `--hidden-import local_temp_monitor`，确保模块进 exe。
+- `local_temp_monitor.py` 拷入项目目录，作为唯一温度数据源。
+
+### 实测（本机）
+- GPU：GTX 1080 **41°C / 11%**（nvidia-smi 实测）；CPU：AMD Ryzen 5 5600X 负载 9%（无温度）；
+  磁盘：4 块物理盘 36–37°C（StorageReliabilityCounter）；ACPI 温控区/温度探针为空（台式机常态）。
+- 单测 22 项全过；后端集成冒烟：ready=True、temps={gpu:41.0}、fans=[]、各 probe 分类正确。
+
+---
+
+## v18.41 — 移植 WinosInfo 硬件温度识别能力（LibreHardwareMonitor 同源）
+
+### 背景：WinosInfo 与本工具同源于 WinRing0
+- 用户要求「直接移植」WinosInfo 的硬件温度识别能力。
+- 字符串/反编译分析确认 WinosInfo 使用 `WinRing0` ring-0 驱动 + `ADL_Overdrive5_Temperature_Get`（AMD GPU）
+  取温度，与本工具后端 LibreHardwareMonitor 的底层通道**完全一致**。
+- 实测 WinosInfo 在本机因无法加载其 WinRing0 内核驱动而启动失败（进程 8s 内退出、无窗口），
+  而 LHM 同源可读且稳定，已暴露 16 路温度 / 7 路风扇 / 23 路电压等全量传感器。
+- 结论：无需也无法「移植其引擎」，直接复用已工作的 LHM 后端，把数据以
+  WinosInfo/HWiNFO 那种「实时、按硬件分组、温度阈值变色」的方式呈现。
+
+### 新增：实时硬件传感器总览
+- 「传感器」按钮改为打开**非模态、实时刷新（2s）**的「硬件传感器总览」窗口。
+- 顶部 5 张「关键温度」卡片：CPU / GPU / 主板 / 磁盘 / 内存，
+  按阈值着色（绿 <60℃ / 黄 60–80℃ / 红 ≥80℃），内存无探头显示灰字「无探头」。
+- 下半部按硬件分组列出全部传感器（温度/风扇/转速/电压/负载…），
+  分组头按硬件类别着色（CPU 蓝 / GPU 紫 / 主板 绿 / 磁盘 青 / 内存 橙），
+  温度当前值同样按阈值变色；未接线通道标灰「（未接线）」。
+- 保留「显示全部传感器」勾选，含内存 SPD 时序/容量等扩展读数。
+
+### 其他
+- 单测全过（pytest 22 项，无回归）；新增离线烟雾测试验证分组着色、
+  关键温度卡片、温度阈值变红均正确。
+
 ## v18.40 — 借鉴 WinosInfo 的内存硬件信息展示
 
 ### 内存温度：已确认 WinosInfo 也读不到

@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -107,10 +108,12 @@ def _ps(script: str, timeout: int = 15) -> Optional[str]:
 #   MSAcpi_ThermalZoneTemperature (root/WMI)              → 空
 #   Win32_PerfFormattedData_Counters_ThermalZoneInformation → 空
 #   厂商命名空间 (ASUS/Gigabyte/MSI/ASRock/HP/Dell)        → 无 Sensor 类
-# 这些都要主板在 ACPI/SMBIOS 里上报热区，台式机普遍没有。唯一免驱来源是
-# LibreHardwareMonitor / OpenHardwareMonitor 暴露的 WMI 命名空间——它自带
-# 内核驱动直接读 Super I/O / EC 芯片，装了才有数据，没装显示 —（降级不报错）。
-# PowerShell spawn 有数百 ms 开销，故 10s 缓存节流；命名空间不存在时 120s 才重试。
+# 这些都要主板在 ACPI/SMBIOS 里上报热区，台式机普遍没有。这也是 v18.42 那版
+# 「驱动无关」方案失败的根源——它最终只剩 NVIDIA GPU 和少数磁盘温度可读。
+# v18.43 起内置 LibreHardwareMonitor：自带 Ring-0 驱动直读 Super I/O / EC，
+# 温度、风扇、NVMe 全覆盖，经 http://127.0.0.1:8085/data.json 取数
+# （拉起逻辑见下方 ensure_lhm）。
+# 取一次有网络往返，故 10s 缓存节流；取不到时冷却 120s 再试。
 _SENSOR_TTL_OK = 10.0
 _SENSOR_TTL_FAIL = 120.0
 _SENSOR_NS = ("root/LibreHardwareMonitor", "root/OpenHardwareMonitor")
@@ -372,70 +375,135 @@ def lhm_probe(kind: str):
     return out
 
 
-_LHM_EXE = r"D:\tools\LibreHardwareMonitor\LibreHardwareMonitor.exe"
-_lhm_launch_state = {"last": 0.0}
+# ---------------------------------------------------------------------------
+# v18.43 温度/风扇读取 —— 统一回到 LibreHardwareMonitor
+#
+# v18.42 曾用「驱动无关」方案（WMI + nvidia-smi），实测覆盖极窄：CPU / 主板 /
+# 内存 / NVMe / 风扇转速在 WMI 里全部读不到，只有 NVIDIA GPU 和少量磁盘温度，
+# 因此 v18.43 改回以内置 LHM 作为唯一温度源。
+#
+# 数据流：内置 lhm_bin/LibreHardwareMonitor.exe（隐藏运行）
+#         → http://127.0.0.1:8085/data.json（LHM 树结构）
+#         → _parse_lhm_json 解析出 temps/fans + 完整传感器分组
+#
+# 关键坑（本次修复的根因）：LHM 读的配置文件是
+#     Path.ChangeExtension(Application.ExecutablePath, ".config")
+#   → LibreHardwareMonitor.config，而**不是** LibreHardwareMonitor.exe.config。
+#   前者是它自己的 PersistentSettings（写 runWebServerMenuItem=true 才生效），
+#   后者只服务于 CLR 程序集绑定。写错文件会导致 8085 永不监听且无任何报错。
+# ---------------------------------------------------------------------------
+_LHM_PORT = 8085
+_LHM_URL = "http://127.0.0.1:%d/data.json" % _LHM_PORT
+_LHM_EXE = "LibreHardwareMonitor.exe"
+# 冷启动后 Web Server 响应了，但 HDD / NVMe 这类慢热传感器的 Value 还要
+# 再过约 0.5s 才填上（实测：到位瞬间 disk 读数只有 3/4，+0.5s 才齐）。
+# 等这一小会儿，让交给 UI 的首帧就是完整的，不必等下一个 10s 周期。
+_LHM_WARMUP = 1.5
+_lhm_state = {"retry_after": 0.0, "launched_ts": 0.0}
 
 
-def ensure_lhm():
-    """传感器查询失败且 LHM 未运行时，静默拉起（10 分钟节流，防止反复 spawn）。
+def _lhm_bin_dir() -> str:
+    """定位内置 LHM 目录：PyInstaller 走 _MEIPASS，源码直跑走脚本旁。"""
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        cand = os.path.join(base, "lhm_bin")
+        if os.path.isdir(cand):
+            return cand
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "lhm_bin")
 
-    LHM 的 WMI/HTTP 数据只在它运行期间存在；窗口被误关或进程退出后
-    CPU/主板温度与风扇转速就会全部变 —。这里做无人值守自愈：
-    路径存在 + 进程不在 → 分离方式启动（不阻塞采样线程、无窗口闪挂）。
+
+def _lhm_fetch(timeout: float = 2.5):
+    """取 /data.json 原文；LHM 未运行 / 超时返回 None。
+
+    显式声明 Accept-Encoding: identity 绕开 gzip——LHM 认 Accept-Encoding
+    含 gzip 时会回压缩体，这里直接要明文，少一道解压环节也更好排错。
     """
-    if not os.path.exists(_LHM_EXE):
-        return
+    try:
+        req = urllib.request.Request(_LHM_URL,
+                                     headers={"Accept-Encoding": "identity"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def is_lhm_running() -> bool:
+    """Web Server 是否可用（用真实取数判定，比扫端口可靠）。"""
+    return _lhm_fetch(timeout=1.5) is not None
+
+
+def ensure_lhm(wait: float = 12.0) -> bool:
+    """确保内置 LHM 在后台运行且 Web Server 就绪；必要时隐藏拉起。
+
+    用 STARTF_USESHOWWINDOW + SW_HIDE 配合 CREATE_NO_WINDOW 启动，进程无窗口、
+    无控制台闪现。已运行时直接返回；拉起失败进入冷却期，避免每周期反复起进程。
+    返回 True 表示此刻可以取到 /data.json。
+    """
     now = time.time()
-    if now - _lhm_launch_state["last"] < 600:
-        return
-    _lhm_launch_state["last"] = now
-    try:
-        out = _ps("(Get-Process LibreHardwareMonitor -ErrorAction SilentlyContinue) "
-                  "-ne $null", timeout=6)
-        if (out or "").strip().lower() == "true":
-            return
-        subprocess.Popen([_LHM_EXE], creationflags=0x00000008,   # DETACHED_PROCESS
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    if is_lhm_running():
+        _lhm_state["retry_after"] = 0.0
+        return True
+    if now < _lhm_state["retry_after"]:
+        return False
 
+    exe = os.path.join(_lhm_bin_dir(), _LHM_EXE)
+    if not os.path.isfile(exe):
+        _lhm_state["retry_after"] = now + 180.0
+        return False
 
-def _query_sensors():
-    """优先 LibreHardwareMonitor Web Server（v0.9+ 已移除 WMI Provider），
-    回退 OpenHardwareMonitor WMI（老版有 WMI）。返回 (fans, temps, ready)。"""
     try:
-        import urllib.request
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        raw = opener.open("http://127.0.0.1:8085/data.json", timeout=5).read()
-        fans, temps, ready = _parse_lhm_json(raw.decode("utf-8-sig", "ignore"))
-        if ready:
-            return fans, temps, True
+        si = subprocess.STARTUPINFO()          # 非 Windows 上不存在，抛错由下面兜住
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0                     # SW_HIDE
+        cf = 0x08000000                        # CREATE_NO_WINDOW
+        if sys.platform == "win32":
+            cf |= 0x00000008                   # DETACHED_PROCESS
+        subprocess.Popen(
+            [exe], cwd=os.path.dirname(exe), startupinfo=si, creationflags=cf,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
     except Exception:
-        pass
-    for ns in _SENSOR_NS:
-        out = _ps(f"(Get-CimInstance -Namespace {ns} -ClassName Sensor "
-                  f"-ErrorAction SilentlyContinue | "
-                  f"Select-Object Name,SensorType,Value,Identifier | "
-                  f"ConvertTo-Json -Compress)", timeout=8)
-        if not out:
-            continue
-        fans, temps = _parse_sensors(out)
-        if fans or temps:
-            return fans, temps, True
-    ensure_lhm()
-    return [], {}, False
+        _lhm_state["retry_after"] = now + 60.0
+        return False
+
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        time.sleep(0.8)
+        if is_lhm_running():
+            time.sleep(_LHM_WARMUP)         # 等慢热传感器（HDD/NVMe）填上首帧值
+            _lhm_state["launched_ts"] = time.time()
+            _lhm_state["retry_after"] = 0.0
+            return True
+    _lhm_state["retry_after"] = time.time() + 45.0
+    return False
 
 
 def sensor_snapshot_cached(force: bool = False):
-    """(fans, temps, ready)：10s 缓存；force 用于「重新检测硬件」立即刷新。"""
+    """(fans, temps, ready)：10s 缓存；force 用于「重新检测硬件」立即刷新。
+
+    v18.43 起数据源回到内置 LibreHardwareMonitor：CPU(Tctl/Tdie)、GPU Core /
+    Hot Spot、主板 SuperIO、内存、NVMe、机械盘、风扇转速全覆盖。SuperIO 上未接
+    探头的脏通道（实测 3°C / 110°C）由 _parse_lhm_json 的 5–100°C 过滤剔除。
+    LHM 尚未运行时会顺手隐藏拉起；确实拉不起来才 ready=False 并转入长冷却。
+    """
     now = time.time()
     st = _sensor_state
     if not force and now - st["last_ts"] < st["ttl"]:
         return st["fans"], st["temps"], st["ready"]
-    fans, temps, ready = _query_sensors()
+
+    text = _lhm_fetch()
+    if text is None:
+        ensure_lhm()
+        text = _lhm_fetch()
+    if text is None:
+        st.update(last_ts=now, ttl=_SENSOR_TTL_FAIL, ready=False)
+        return st["fans"], st["temps"], False
+
+    fans, temps, ready = _parse_lhm_json(text)
     st.update(fans=fans, temps=temps, ready=ready, last_ts=now,
               ttl=_SENSOR_TTL_OK if ready else _SENSOR_TTL_FAIL)
     return fans, temps, ready
+
 
 
 def fan_rpms_cached() -> list:

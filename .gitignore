@@ -37,3 +37,18 @@ _probe_*.py
 _diag_*.py
 _src_bundle/
 _staging*.exe
+
+# v18.43 内置 LibreHardwareMonitor：第三方二进制与源码不入库
+# （构建脚本 build_v1837.py::prepare_lhm 负责从 lhm_bin/ 精简出 lhm_pack/）
+lhm_bin/
+lhm_pack/
+LHM_src/
+
+# LHM 传感器快照 / WinosInfo 排查截图（一次性诊断产物）
+_lhm_*.json
+_winos_*.png
+
+# v18.42 驱动无关方案（WMI + nvidia-smi），已被内置 LHM 全面取代，仅留本地备查
+local_temp_monitor.py
+
+.pytest_cache/

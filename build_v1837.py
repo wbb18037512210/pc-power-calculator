@@ -31,9 +31,60 @@ def ver():
     return m.group(1) if m else ""
 
 
+def prepare_lhm():
+    """把 lhm_bin/ 精简出一个可直接打包的副本 lhm_pack/。
+
+    剔除调试符号(.pdb)、API 文档(.xml)、原始下载包 lhm.zip、旧配置备份(.bak)：
+    实测这些约 7.8MB，砍掉后 19MB → 11MB。
+
+    同时重写 LibreHardwareMonitor.config —— LHM 读的是
+    Path.ChangeExtension(exe, ".config") 的产物即 **LibreHardwareMonitor.config**，
+    不是 LibreHardwareMonitor.exe.config。写错文件会导致 8085 永不监听且无报错，
+    所以这里每次构建都按确定内容重新生成，不依赖源码目录里的手写配置。
+    """
+    src = os.path.join(ROOT, "lhm_bin")
+    dst = os.path.join(ROOT, "lhm_pack")
+    if os.path.isdir(dst):
+        shutil.rmtree(dst, ignore_errors=True)
+    if not os.path.isdir(src):
+        print("[warn] 未找到 lhm_bin，温度读取将不可用", flush=True)
+        return None
+    skip_ext = (".pdb", ".xml", ".bak", ".zip")
+    os.makedirs(dst, exist_ok=True)
+    n = 0
+    for name in sorted(os.listdir(src)):
+        p = os.path.join(src, name)
+        if os.path.isdir(p):                    # 各语言资源目录（体积很小，保留）
+            shutil.copytree(p, os.path.join(dst, name))
+            continue
+        if name.lower().endswith(skip_ext):
+            continue
+        if name == "LibreHardwareMonitor.config":
+            continue                            # 下面统一重新生成
+        shutil.copy2(p, os.path.join(dst, name))
+        n += 1
+    with open(os.path.join(dst, "LibreHardwareMonitor.config"), "w",
+              encoding="utf-8") as f:
+        f.write(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<configuration>\n"
+            "  <appSettings>\n"
+            '    <add key="runWebServerMenuItem" value="true" />\n'
+            '    <add key="listenerIp" value="127.0.0.1" />\n'
+            '    <add key="listenerPort" value="8085" />\n'
+            '    <add key="authenticationEnabled" value="false" />\n'
+            '    <add key="theme" value="auto" />\n'
+            "  </appSettings>\n"
+            "</configuration>\n")
+    print("[lhm] %d 个文件 -> lhm_pack" % n, flush=True)
+    return "lhm_pack"
+
+
 V = ver()
 print("[ver]", V, flush=True)
 assert V, "未解析到 APP_VERSION"
+
+LHM_PACK = prepare_lhm()
 
 # 1) 关闭运行中的实例
 run([PY, "kill_instances.py"])
@@ -75,8 +126,11 @@ for m in ("QtWebEngineCore", "QtWebEngineWidgets", "QtWebEngineQuick", "QtWebCha
     excludes += ["--exclude-module", "PySide6." + m]
 
 cmd = [PY, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed",
-       "--name", NAME, "--distpath=release", "--workpath=build\\build"] + excludes + \
-      ["--add-data", "_src_bundle;src", "main.py"]
+       "--name", NAME, "--distpath=release", "--workpath=build\\build"] + excludes
+# v18.43 内置 LibreHardwareMonitor（温度 / 风扇转速的唯一数据源）
+if LHM_PACK:
+    cmd += ["--add-data", "%s;lhm_bin" % LHM_PACK]
+cmd += ["--add-data", "_src_bundle;src", "main.py"]
 t0 = time.time()
 r = run(cmd)
 print("[pyinstaller] exit=%s  用时 %.0fs" % (r.returncode, time.time() - t0), flush=True)
@@ -122,4 +176,5 @@ for f in glob.glob(os.path.join(REL, "*源码*%s.zip" % V)):
 
 # 9) 清临时目录
 shutil.rmtree(os.path.join(ROOT, "_src_bundle"), ignore_errors=True)
+shutil.rmtree(os.path.join(ROOT, "lhm_pack"), ignore_errors=True)
 print("[done]", flush=True)

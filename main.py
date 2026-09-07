@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.40"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.43"       # 界面标题/托盘提示展示的版本号
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -1104,7 +1104,7 @@ class MainWindow(QMainWindow):
         # 会透过进度条单元格的透明容器渗出（EXE 冒烟实测 CPU 行出现蓝色大块）
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        # v18.37 双击「温度/转速」列 → 打开 LibreHardwareMonitor 传感器详情
+        # v18.43 双击「温度/转速」列 → 打开内置 LHM 传感器详情对照
         self.table.cellDoubleClicked.connect(self._on_table_dbl)
         lay.addWidget(self.table, 1)
         # PSU 建议
@@ -1301,7 +1301,7 @@ class MainWindow(QMainWindow):
                       f"{self._short_model(dk.get('model'), 14)} [{tag}] "
                       f"{dk.get('sizeGB') or '—'}GB {dk.get('letters') or ''} "
                       f"{self._temp_html(dt, 45, 55)}</div>")
-        # v18.35 风扇转速（LibreHardwareMonitor/OpenHardwareMonitor WMI，装了才有）
+        # v18.43 风扇转速（内置 LibreHardwareMonitor 的 SuperIO / 显卡风扇）
         fans = dyn.get("fans") or []
         if fans:
             fan_txt = " · ".join(f"{n} {v}RPM" for n, v in fans[:3])
@@ -1438,7 +1438,7 @@ class MainWindow(QMainWindow):
         self.btn_settings.clicked.connect(self.open_settings)
         self.btn_apps = QPushButton("软件耗电"); self.btn_apps.setObjectName("ghost")
         self.btn_apps.clicked.connect(self.open_apps)
-        # v18.37 传感器详情（以 LibreHardwareMonitor 为参考的温度/转速对照）
+        # v18.43 传感器详情（内置 LibreHardwareMonitor 读数对照）
         self.btn_sensors = QPushButton("传感器"); self.btn_sensors.setObjectName("ghost")
         self.btn_sensors.clicked.connect(self.open_sensors)
         # v18.35 平铺：9 个按钮一行均分铺满整张卡片（此前 5+4 两行第二行
@@ -1966,7 +1966,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 u = None
             if u is not None:
-                self._gpu_util_src = "LHM"
+                self._gpu_util_src = "nvidia-smi"
                 return u
             gp = self.cur.get("gpu_power") if isinstance(self.cur, dict) else None
             tdp = float(getattr(self.model, "gpu_tdp", 0) or 0)
@@ -2029,16 +2029,15 @@ class MainWindow(QMainWindow):
                     "memory": (50, 60), "board": (55, 70)}
 
     def _temp_text_color(self, name):
-        """v18.36 构成表「温度 / 转速」列。返回 (文本, QColor|None)。
+        """v18.43 构成表「温度 / 转速」列。返回 (文本, QColor|None)。
 
-        数据来源（按优先级）：
-          CPU   — 主板热区计数器（Win32_PerfFormattedData...ThermalZone，多数
-                  台式机为空）→ LibreHardwareMonitor WMI（sensor_temps.cpu）
-          内存  — LHM WMI（sensor_temps.memory）；Windows 无免驱接口
-          主板  — LHM WMI（sensor_temps.motherboard）；同上
-          GPU   — nvidia-smi / ADL；磁盘 — StorageReliabilityCounter
-          风扇  — 无温度概念，改显示最高转速 RPM（LHM WMI）
-        没装 LHM 时 CPU/内存/主板/风扇显示 —（tooltip 会提示如何开启）。
+        数据来源统一为内置 LibreHardwareMonitor（后台隐藏运行的 Web Server）：
+          CPU   — AMD Tctl/Tdie 或 Intel Package（另有 CCD / Core 分核温度）
+          GPU   — GPU Core / Hot Spot（N 卡经 NVML 读取）
+          主板  — SuperIO（如 NCT6793D）各路通道，脏通道按 5–100°C 剔除
+          磁盘  — NVMe Composite 与 HDD SMART 温度
+          内存  — 需内存条带 SPD 温度探头；本机无探头时显示「无探头」
+          风扇  — SuperIO / 显卡风扇转速
         """
         n = str(name).upper()
         dyn = getattr(self, "_sys_dyn", None) or {}
@@ -2089,9 +2088,8 @@ class MainWindow(QMainWindow):
             QColor("#d99a17") if t < hot else QColor("#d8492f"))
         return f"{t:.0f}°", col
 
-    # v18.37 温度/转速列的「LHM 参考读数」：直接把 LibreHardwareMonitor 面板上
-    # 的原始传感器名与读数列出来（带 Min/Max 之外的当前值），便于逐项核对。
-    # Windows 免驱读不到 SuperIO，LHM 是唯一可信来源，故做显式对照。
+    # v18.43 温度/转速列的参考读数直接取自内置 LibreHardwareMonitor，
+    # 分组、命名与 Min/Value/Max 与 LHM 面板完全一致（便于逐项核对）。
     _LHM_PART_KIND = (("CPU", "cpu"), ("GPU", "gpu"), ("内存", "memory"),
                       ("主板", "motherboard"), ("芯片", "motherboard"),
                       ("风扇", "fan"), ("SSD", "disk"), ("HDD", "disk"))
@@ -2114,31 +2112,101 @@ class MainWindow(QMainWindow):
             # 缓存尚未填充时 ready 也还没意义，先不提示，等首个采样周期落地。
             _ok = (getattr(self, "_sys_dyn", None) or {}).get("sensor_ready")
             if not _ok:
-                return ("未连接到 LibreHardwareMonitor\n"
-                        "温度/转速需经其 Web Server（127.0.0.1:8085）读取\n"
-                        "（Windows 免驱读不到 SuperIO/EC 芯片）")
+                return ("未读取到传感器数据\n"
+                        "内置 LibreHardwareMonitor 正在后台启动中，稍候会自动补齐")
             if "内存" in s:
-                return ("内存温度读不到：本机的内存条没有 SPD 温度探头\n"
-                        "（LHM 只能读到容量与 SPD 时序；DDR5 / 部分高端 DDR4 才有温度探头）\n"
-                        "这是硬件限制，HWiNFO、AIDA64 等同样读不到")
-            return ("LibreHardwareMonitor 未报告「%s」的温度/转速\n"
-                    "该部件本身通常不带温度探头（属正常现象）" % s)
+                return ("内存温度读不到：本机内存条无 SPD 温度探头\n"
+                        "这是硬件限制，HWiNFO、AIDA64、WinosInfo 同样读不到")
+            return ("LibreHardwareMonitor 未提供「%s」的温度\n"
+                    "（该部件在本机没有可用传感器通道）" % s)
         return ("LibreHardwareMonitor 参考读数\n"
                 + "\n".join("• %s：%s" % (a, b) for a, b in rows[:14]))
 
     def open_sensors(self):
-        """v18.37 传感器详情：照 LHM 的分组方式列出温度/风扇/控制等原始读数。"""
+        """v18.43 硬件传感器总览。
+
+        数据源为随程序内置的 LibreHardwareMonitor（后台隐藏运行，读
+        http://127.0.0.1:8085/data.json），用户无需另行安装：实时、按硬件分组的
+        温度/风扇/电压总览；顶部「关键温度」卡片一键看全机热点，温度按阈值
+        变色（绿<60 / 黄60-80 / 红>=80）。
+
+        覆盖说明：CPU、GPU、主板 SuperIO、NVMe / HDD、风扇转速均可读；
+        内存需条上带 SPD 温度探头才有值，否则显示「无探头」。
+        SuperIO 未接线的通道以灰色标注「（未接线）」，与 LHM 面板口径一致。
+        """
+        # 避免重复打开：已开则置顶
+        _old = getattr(self, "_mon_dlg", None)
+        if _old is not None:
+            try:
+                if _old.isVisible():
+                    _old.raise_(); _old.activateWindow(); return
+            except RuntimeError:
+                pass
+
         TYPES = ("Temperature", "Fan", "Control", "Power", "Clock", "Load")
         TYPES_ALL = TYPES + ("Data", "Timing", "Voltage", "Current",
                              "Level", "Throughput", "Factor", "SmallData")
+        _KIND_COLOR = {"cpu": "#2f6fed", "gpu": "#8e44ad", "board": "#1f9d55",
+                       "memory": "#e67e22", "disk": "#16a085", "fan": "#7f8c8d",
+                       "other": "#5a6478"}
+        _KIND_META = {"cpu": ("CPU", "#2f6fed"), "gpu": ("GPU", "#8e44ad"),
+                      "board": ("主板", "#1f9d55"), "disk": ("磁盘", "#16a085"),
+                      "memory": ("内存", "#e67e22")}
+
+        def _kind_of(hwid):
+            h = str(hwid or "")
+            for pfx, k in (("/amdcpu", "cpu"), ("/intelcpu", "cpu"),
+                           ("/lpc", "board"), ("/motherboard", "board"),
+                           ("/acpi", "board"), ("/probe", "board"),
+                           ("/ram", "memory"), ("/memory", "memory"),
+                           ("/gpu", "gpu"), ("/nvme", "disk"), ("/hdd", "disk")):
+                if h.startswith(pfx):
+                    return k
+            return "other"
+
+        def _temp_color(v):
+            if v is None or not (5.0 <= v <= 100.0):
+                return QColor("#9aa3b2")
+            if v < 60:
+                return QColor("#1f9d55")
+            if v < 80:
+                return QColor("#e0a800")
+            return QColor("#d9534f")
+
+        def _pick(lst, prefs):
+            for p in prefs:
+                if p == "":
+                    return max(lst, key=lambda x: x[1])[1]
+                for nm, fv in lst:
+                    if p in nm:
+                        return fv
+            return max(lst, key=lambda x: x[1])[1]
+
         d = QDialog(self)
-        d.setWindowTitle("传感器详情 · LibreHardwareMonitor")
-        d.resize(760, 580)
+        d.setWindowTitle("硬件传感器总览 · LibreHardwareMonitor")
+        d.resize(820, 640)
+        d.setWindowModality(Qt.NonModal)
         vl = QVBoxLayout(d)
-        tip = QLabel()
-        tip.setWordWrap(True)
+
+        # 顶部：关键温度卡片（绿<60 / 黄60-80 / 红>=80）
+        top = QHBoxLayout(); top.setSpacing(8)
+        _cards = {}
+        for k, (lab, col) in _KIND_META.items():
+            cw = QWidget(); cw.setStyleSheet(
+                f"border:1px solid {col}55;border-left:4px solid {col};"
+                f"border-radius:8px;padding:4px 8px;")
+            cl = QVBoxLayout(cw); cl.setContentsMargins(4, 2, 4, 2)
+            t = QLabel(lab); t.setStyleSheet(f"color:{col};font-weight:700;font-size:12px;")
+            v = QLabel("—"); v.setStyleSheet("font-size:22px;font-weight:800;color:#9aa3b2;")
+            cl.addWidget(t); cl.addWidget(v)
+            _cards[k] = v
+            top.addWidget(cw)
+        vl.addLayout(top)
+
+        tip = QLabel(); tip.setWordWrap(True)
         tip.setStyleSheet("color:#5a6478;font-size:12px;")
         vl.addWidget(tip)
+
         tree = QTableWidget(0, 4)
         tree.setHorizontalHeaderLabels(["传感器", "最小", "当前", "最大"])
         tree.verticalHeader().hide()
@@ -2153,11 +2221,40 @@ class MainWindow(QMainWindow):
 
         _show_all = {"v": False}
 
-        def _fill():
-            try:
-                snap = H.lhm_sensors(force=True)
-            except Exception:
-                snap = {"ok": False, "groups": []}
+        def _fill_top(snap):
+            rep = {}
+            for g in snap.get("groups") or []:
+                kind = _kind_of(g.get("hwid"))
+                for sn in g.get("sensors") or []:
+                    if sn.get("type") != "Temperature":
+                        continue
+                    try:
+                        fv = float((sn.get("value") or "").split()[0])
+                    except (ValueError, IndexError):
+                        continue
+                    if not (5.0 <= fv <= 100.0):
+                        continue
+                    rep.setdefault(kind, []).append(((sn.get("name") or "").lower(), fv))
+            pick = {"cpu": ("tctl", "core", "ccd"), "gpu": ("core", "hot", ""),
+                    "board": ("",), "disk": ("composite", "", ""), "memory": ("",)}
+            for k, (lab, col) in _KIND_META.items():
+                w = _cards[k]
+                val = None
+                if rep.get(k):
+                    val = _pick(rep[k], pick.get(k, ("",)))
+                if val is None:
+                    if k == "memory":
+                        w.setText("无探头")
+                        w.setStyleSheet("font-size:15px;font-weight:800;color:#9aa3b2;")
+                    else:
+                        w.setText("—")
+                        w.setStyleSheet("font-size:22px;font-weight:800;color:#9aa3b2;")
+                else:
+                    w.setText(f"{val:.0f}°")
+                    w.setStyleSheet(
+                        f"font-size:22px;font-weight:800;color:{_temp_color(val).name()};")
+
+        def _fill_tree(snap):
             tree.setRowCount(0)
             n = 0
             _ty = TYPES_ALL if _show_all["v"] else TYPES
@@ -2165,16 +2262,17 @@ class MainWindow(QMainWindow):
                 ss = [x for x in (g.get("sensors") or []) if x.get("type") in _ty]
                 if not ss:
                     continue
+                kind = _kind_of(g.get("hwid"))
+                hdr = _KIND_COLOR.get(kind, "#5a6478")
                 r = tree.rowCount()
                 tree.insertRow(r)
                 _p = str(g.get("parent") or "")
                 _title = (f"{_p} › {g.get('name')}" if _p and _p != g.get("name")
                           else str(g.get("name") or ""))
                 h = QTableWidgetItem(_title)
-                f = h.font()
-                f.setBold(True)
-                h.setFont(f)
-                h.setBackground(QBrush(QColor("#eef1f7")))
+                f = h.font(); f.setBold(True); h.setFont(f)
+                h.setBackground(QBrush(QColor(hdr)))
+                h.setForeground(QBrush(QColor("#ffffff")))
                 tree.setItem(r, 0, h)
                 tree.setSpan(r, 0, 1, 4)
                 for x in ss:
@@ -2183,6 +2281,7 @@ class MainWindow(QMainWindow):
                     _nm = str(x.get("name") or "")
                     _val = str(x.get("value") or "")
                     _bad = False
+                    _fv = None
                     try:
                         _fv = float(_val.split()[0])
                         if x.get("type") == "Temperature":
@@ -2195,43 +2294,57 @@ class MainWindow(QMainWindow):
                     tree.setItem(r, 0, _it)
                     tree.setItem(r, 1, QTableWidgetItem(str(x.get("min") or "")))
                     _v = QTableWidgetItem(_val)
-                    _vf = _v.font()
-                    _vf.setBold(True)
-                    _v.setFont(_vf)
+                    _vf = _v.font(); _vf.setBold(True); _v.setFont(_vf)
                     tree.setItem(r, 2, _v)
                     tree.setItem(r, 3, QTableWidgetItem(str(x.get("max") or "")))
-                    if _bad:   # LHM 面板对未接线的通道同样是灰色显示
+                    if _bad:
                         _gray = QBrush(QColor("#9aa3b2"))
                         for _c in (0, 1, 2, 3):
                             tree.item(r, _c).setForeground(_gray)
+                    elif x.get("type") == "Temperature" and _fv is not None:
+                        tree.item(r, 2).setForeground(QBrush(_temp_color(_fv)))
                     n += 1
             if n:
-                tip.setText("数据源：LibreHardwareMonitor Web Server（127.0.0.1:8085）。"
-                            "分组、命名与「最小 / 当前 / 最大」三列与其界面一致。"
-                            "灰色分组行 = 该硬件（LHM 中的节点名）。")
+                tip.setText("数据源：内置 LibreHardwareMonitor（随程序自带，后台隐藏运行）。"
+                            "CPU / GPU / 主板 SuperIO / NVMe / HDD / 风扇转速均可读；"
+                            "内存需条上带 SPD 探头才有温度。未接线的通道标注「（未接线）」。"
+                            "温度按 绿<60℃ / 黄60–80℃ / 红≥80℃ 着色。")
             else:
-                tip.setText("未读取到 LibreHardwareMonitor 数据。请确认 "
-                            "D:\\tools\\LibreHardwareMonitor\\LibreHardwareMonitor.exe 已运行，"
-                            "并已开启 Web Server（选项 → Web Server → 端口 8085、Run）。")
+                tip.setText("LibreHardwareMonitor 暂未提供传感器数据。"
+                            "程序会在后台自动拉起内置 LHM，稍候点「刷新」即可；"
+                            "若持续为空，多为以受限权限运行时传感器驱动未能加载。")
 
-        _fill()
+        def _refresh():
+            try:
+                snap = H.lhm_sensors(force=True)
+            except Exception:
+                snap = {"ok": False, "groups": []}
+            _fill_top(snap)
+            _fill_tree(snap)
+
+        _refresh()
+        _timer = QTimer(d)
+        _timer.setInterval(2000)
+        _timer.timeout.connect(_refresh)
+        _timer.start()
+
         bar = QHBoxLayout()
-        ck_all = QCheckBox("显示全部传感器（含内存 SPD 时序/容量）")
-        ck_all.toggled.connect(lambda v: (_show_all.__setitem__("v", v), _fill()))
+        ck_all = QCheckBox("显示全部传感器（含电压 / 时钟 / 数据等全部类型）")
+        ck_all.toggled.connect(lambda v: (_show_all.__setitem__("v", v), _refresh()))
         bar.addWidget(ck_all)
         bar.addStretch(1)
         btn_ref = QPushButton("刷新")
         btn_ref.setObjectName("ghost")
         btn_close = QPushButton("关闭")
         btn_close.setObjectName("ghost")
-        btn_ref.clicked.connect(_fill)
-        btn_close.clicked.connect(d.accept)
+        btn_ref.clicked.connect(_refresh)
+        btn_close.clicked.connect(d.close)
         bar.addStretch(1)
         bar.addWidget(btn_ref)
         bar.addWidget(btn_close)
         vl.addLayout(bar)
-        d.exec()
-
+        self._mon_dlg = d
+        d.show()
     def _on_table_dbl(self, r, c):
         """双击构成表「温度/转速」列 → 打开 LHM 传感器详情对照。"""
         if c == 3:
@@ -2245,7 +2358,7 @@ class MainWindow(QMainWindow):
             if src == "nvidia-smi":
                 return "GPU 使用率：nvidia-smi 实测 SM 占用（与任务管理器同口径）"
             if src == "LHM":
-                return "GPU 使用率：LibreHardwareMonitor 的 GPU Core 占用"
+                return "GPU 使用率：LibreHardwareMonitor 实测 GPU Core 占用"
             if src == "估算":
                 return ("GPU 使用率：由「功耗 ÷ TDP」估算\n"
                         "未取到实测占用（nvidia-smi 不可用且非 LHM 可识别显卡）")
