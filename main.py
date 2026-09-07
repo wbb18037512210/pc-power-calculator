@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
     QDialog, QFormLayout, QMessageBox, QFileDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QSizePolicy, QSpacerItem, QCheckBox, QSystemTrayIcon, QMenu,
     QProgressBar, QInputDialog, QTextBrowser, QComboBox, QScrollArea,
-    QGraphicsDropShadowEffect,
+    QGraphicsDropShadowEffect, QSplitter,
 )
 from PySide6.QtCharts import (QChart, QChartView, QLineSeries, QValueAxis,
                               QBarSeries, QBarSet, QBarCategoryAxis, QDateTimeAxis)
@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.44"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.45"       # 界面标题/托盘提示展示的版本号
 
 # v18.44 UI 常量：卡片更紧凑（原散落的 14/12/8）
 UI_MARGIN = 0                # 卡片内容边距
@@ -65,11 +65,13 @@ UI_SHADOW_BLUR = 10          # 卡片投影：更收敛（原 blur 18 / dy 2）
 UI_SHADOW_DY = 1
 # v18.44 窗口预设尺寸（用户指定）
 UI_MONITOR_W = 720
-UI_MONITOR_MIN_H = 260       # 硬件监测：用户当前高 260，可拖更高/更矮
+UI_CARD_LIVE = (720, 260)        # 硬件监测卡片（指定尺寸）       # 硬件监测：用户当前高 260，可拖更高/更矮
 UI_INFO_W = 500
 UI_INFO_MIN_H = 570          # 硬件信息
 UI_BREAKDOWN_W = 500
-UI_BREAKDOWN_MIN_H = 570     # 功耗结构
+UI_CARD_BREAKDOWN = (500, 570)   # 功耗结构卡片（指定尺寸）
+UI_SPLIT_HANDLE = 6              # 分隔条宽度：够窄不占地方，够宽好抓
+UI_DETAIL_H = 230                # 管理功耗明细（自动缩小）的初始高度     # 功耗结构
 UI_DETAIL_W = 1160
 UI_DETAIL_MIN_H = 710        # 管理功耗明细
 UI_SETTINGS_W = 560
@@ -680,59 +682,11 @@ class ChartView(QChartView):
         super().mouseDoubleClickEvent(e)
 
 
-# v18.44 主界面四单元独立化：各自成为一个可单独最小化到任务栏的顶层窗口。
-# key -> (窗口标题, 宽, 高)
-_PANEL_SPEC = (
-    ("monitor",   "硬件监测",     720,  260),
-    ("sysinfo",   "硬件信息",     500,  570),
-    ("breakdown", "功耗结构",     500,  570),
-    ("detail",    "管理功耗明细", 1160, 710),
-)
-
-
-class _PanelWindow(QWidget):
-    """v18.44 承载主界面卡片的独立顶层窗口。
-
-    两个关键点：
-    - Qt.WindowType.Window：带最小化按钮且出现在任务栏；若用 Tool/SubWindow
-      标志则不会在任务栏留条目，用户就没法「单独缩小到任务栏」。
-    - closeEvent 改为 hide：真正关闭会把整棵子树连同 C++ 对象一起销毁，
-      而 MainWindow 的采样刷新槽函数持有 self.table / self.wall_big /
-      self.chart_view 等引用，下一次 on_sample 就是悬空访问崩溃。
-    """
-
-    def __init__(self, key, title, w, h, content):
-        super().__init__()
-        self._key = key
-        self.setWindowTitle(f"{title} · PC 用电电费计算器")
-        # v18.44 一次性覆盖全部窗口类型位，而不是增量 setWindowFlag：
-        # 增量写法会保留 Qt.Tool 等残留位（Tool 既不进任务栏也没有最小化按钮），
-        # 结果就是「最小化=整组窗口一起消失、任务栏里没有各自的条目」。
-        self.setWindowFlags(
-            Qt.WindowType.Window
-            | Qt.WindowType.WindowMinimizeButtonHint
-            | Qt.WindowType.WindowMaximizeButtonHint
-            | Qt.WindowType.WindowCloseButtonHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-        self.setStyleSheet(CSS)          # 独立顶层窗口不继承主窗口样式表
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.addWidget(content, 1)
-        self.resize(w, h)
-        self._on_hidden = None           # 隐藏回调（主窗口用来同步按钮状态）
-
-    def closeEvent(self, e):
-        e.ignore()                       # 不真正销毁，只隐藏
-        self.hide()
-        if self._on_hidden is not None:
-            self._on_hidden(self._key)
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"PC 电脑用电电费计算器 {APP_VERSION}")
-        self.resize(1040, 190)  # v18.44 四个单元移出为独立窗口，主窗只剩标题+控制条
+        self.resize(*self._main_window_size())   # v18.45 按指定卡片尺寸推算
         self.setStyleSheet(CSS)
 
         # v18.29+ W3：降级账本（收敛静默异常，给维护者/用户可见信号）
@@ -957,80 +911,133 @@ class MainWindow(QMainWindow):
 
         # v18.5：本机配置卡片已删除——硬件信息由最左侧系统信息面板全量承载，避免重复
 
-        # v18.44 实时读数 / 功耗曲线 / 功耗构成 / 硬件信息 四个单元不再内嵌，
-        # 各自成为独立顶层窗口（可单独最小化到任务栏），见 _make_panels()。
-        self._make_panels()
+        # v18.45 仍是单一主界面：四个卡片用 QSplitter 组织，
+        # 拖分隔条即可调整各卡片大小（硬件监测 720x260 / 功耗结构 500x570 为指定尺寸，
+        # 硬件信息、管理功耗明细自动缩小占满剩余空间）。
+        page.addWidget(self._build_main_split(), 1)
 
-        # 控制条（含四个面板窗口的显隐开关）
+        # 控制条
         page.addWidget(self._control_bar())
 
-    # ---------------- v18.44 独立面板窗口 ----------------
-    def _make_panels(self):
-        """把四个卡片 reparent 到 _PanelWindow 顶层窗口。
+        # v18.45 分隔条初始尺寸要等首帧布局算完才有意义（此时 geometry 才非 0），
+        # 故延后一帧；若 _load_session_maybe 随后还原了历史布局，
+        # _split_restored 会让这次默认分配自动让位。
+        QTimer.singleShot(0, self._init_split_sizes)
 
-        reparent 后 MainWindow 的引用（self.wall_big / self.table / self.chart_view /
-        self.sysinfo_view …）全部保持不变，采样刷新照旧写进这些控件，
-        Qt 会把重绘投递到新的父窗口。
+    # ---------------- v18.45 主界面分栏（拖动分隔条调整卡片大小） ----------------
+    def _main_window_size(self):
+        """按指定卡片尺寸推算主窗口大小，并夹进屏幕可用区。
+
+        宽 = 硬件监测 720 + 功耗结构 500 + 边距/分隔条；
+        高 = 功耗结构 570 + 底部明细 230 + 标题栏/控制条/边距。
         """
-        self.panels = {}
-        builders = {
-            "monitor":   lambda: self._live_card(),       # 硬件监测     720x260
-            "sysinfo":   lambda: self._sysinfo_panel(),   # 硬件信息     500x570
-            "breakdown": lambda: self._breakdown_card(),  # 功耗结构     500x570
-            "detail":    lambda: self._chart_card(),      # 管理功耗明细 1160x710
-        }
-        for key, title, w, h in _PANEL_SPEC:
-            pw = _PanelWindow(key, title, w, h, builders[key]())
-            pw._on_hidden = self._on_panel_hidden
-            self.panels[key] = pw
-
-    def _on_panel_hidden(self, key):
-        """面板被关闭（实为隐藏）时，同步控制条按钮的勾选状态。"""
-        b = getattr(self, "_panel_btns", {}).get(key)
-        if b is not None and b.isChecked():
-            try:
-                b.blockSignals(True)
-                b.setChecked(False)
-            finally:
-                b.blockSignals(False)
-
-    def _toggle_panel(self, key, on):
-        pw = getattr(self, "panels", {}).get(key)
-        if pw is None:
-            return
-        pw.setVisible(bool(on))
-        if on:
-            pw.showNormal()      # 从任务栏恢复
-            pw.raise_()
-            pw.activateWindow()
-
-    def _tile_panels(self):
-        """v18.44 首次显示时把四个面板从左到右错开摆放，避免层层叠在左上角。
-
-        宽度累计超出屏幕可用宽就换行。位置只在内存里算，不落盘——
-        用户自己拖过的位置每次会话重新排布更可控。
-        """
+        lw, _lh = UI_CARD_LIVE
+        bw, bh = UI_CARD_BREAKDOWN
+        # 内容区宽 = 硬件监测 720 + 分隔条 HANDLE + 功耗结构 500，再加页面左右边距 16
+        # 内容区高 = 功耗结构 570 + 分隔条 HANDLE + 底部明细 230，再加标题/控制条/间距 158
+        w = lw + bw + UI_SPLIT_HANDLE + 16
+        h = bh + UI_DETAIL_H + UI_SPLIT_HANDLE + 158
         try:
             scr = QApplication.primaryScreen()
-            g = scr.availableGeometry() if scr is not None else None
-            if g is None:
-                return
-            x = g.left() + 16
-            y = g.top() + 16
-            row_h = 0
-            for key, _title, w, h in _PANEL_SPEC:
-                pw = self.panels.get(key)
-                if pw is None:
-                    continue
-                if x + w > g.right() and x > g.left():
-                    x = g.left() + 16
-                    y += row_h + 24
-                    row_h = 0
-                pw.move(x, y)
-                x += w + 12
-                row_h = max(row_h, h)
+            ag = scr.availableGeometry() if scr is not None else None
+            if ag is not None:
+                w = min(w, max(900, ag.width() - 40))
+                h = min(h, max(560, ag.height() - 40))
         except Exception:
-            _log.exception("面板初始摆放失败")
+            pass
+        return (int(w), int(h))
+
+    def _init_split_sizes(self):
+        """v18.45 首帧后的默认尺寸分配；历史布局已还原则跳过。"""
+        if getattr(self, "_split_restored", False):
+            return
+        sp = getattr(self, "_split_main", None)
+        # 「非内容区」（标题栏+控制条+边距+间距）与字体/DPI 有关，硬编码必然偏：
+        # 实测 964 高的窗口里它只占 85px，按 158 估算会把功耗结构挤成 643。
+        # 故先量一次再反推所需窗口尺寸，保证两张指定卡片精确命中。
+        if (sp is not None and sp.height() > 0 and sp.width() > 0
+                and not getattr(self, "_split_fit_done", False)):
+            self._split_fit_done = True
+            chrome_h = self.height() - sp.height()
+            chrome_w = self.width() - sp.width()
+            need_w = UI_CARD_LIVE[0] + UI_SPLIT_HANDLE + UI_CARD_BREAKDOWN[0] + chrome_w
+            need_h = (UI_CARD_BREAKDOWN[1] + UI_SPLIT_HANDLE + UI_DETAIL_H
+                      + chrome_h)
+            try:
+                scr = QApplication.primaryScreen()
+                ag = scr.availableGeometry() if scr is not None else None
+                if ag is not None:
+                    need_w = min(need_w, max(900, ag.width() - 40))
+                    need_h = min(need_h, max(560, ag.height() - 40))
+            except Exception:
+                pass
+            if abs(need_w - self.width()) > 4 or abs(need_h - self.height()) > 4:
+                self.resize(int(need_w), int(need_h))
+                QTimer.singleShot(0, self._init_split_sizes)   # 改完尺寸再来定分栏
+                return
+        self._reset_split_sizes()
+
+    def _build_main_split(self):
+        """v18.45 单一主界面，四个卡片用嵌套 QSplitter 组织。
+
+            VSplit（主）
+            ├─ HSplit（上部）
+            │   ├─ VSplit（左）: 硬件监测 720x260 / 硬件信息（自动缩小）
+            │   └─ 功耗结构 500x570
+            └─ 管理功耗明细（自动缩小，底部通栏）
+
+        拖动任意分隔条即改变相邻卡片大小；setChildrenCollapsible(False)
+        防止把卡片整个拖没（拖到 0 后拉不回来）。
+        """
+        _SS = ("QSplitter::handle { background: #dfe4ee; border-radius: 2px; }"
+               "QSplitter::handle:hover { background: #2f6bff; }")
+
+        left = QSplitter(Qt.Orientation.Vertical)
+        left.addWidget(self._live_card())        # 硬件监测   720x260
+        left.addWidget(self._sysinfo_panel())    # 硬件信息   自动缩小
+        left.setChildrenCollapsible(False)
+        left.setHandleWidth(6)
+        left.setStyleSheet(_SS)
+
+        top = QSplitter(Qt.Orientation.Horizontal)
+        top.addWidget(left)
+        top.addWidget(self._breakdown_card())    # 功耗结构   500x570
+        top.setChildrenCollapsible(False)
+        top.setHandleWidth(6)
+        top.setStyleSheet(_SS)
+
+        self._split_main = QSplitter(Qt.Orientation.Vertical)
+        self._split_main.addWidget(top)
+        self._split_main.addWidget(self._chart_card())   # 管理功耗明细 自动缩小
+        self._split_main.setChildrenCollapsible(False)
+        self._split_main.setHandleWidth(6)
+        self._split_main.setStyleSheet(_SS)
+        return self._split_main
+
+    def _reset_split_sizes(self):
+        """按 UI_CARD_* 指定尺寸给分隔条分配初始空间，其余自动缩小。"""
+        try:
+            sp = getattr(self, "_split_main", None)
+            if sp is None:
+                return
+            top = sp.widget(0)
+            left = top.widget(0)
+            _lw, lh = UI_CARD_LIVE
+            bw, _bh = UI_CARD_BREAKDOWN
+            HW = sp.handleWidth() or UI_SPLIT_HANDLE
+            # setSizes 收到的是「分配额度」，分隔条自身还要吃掉 HW，
+            # 少减这 HW 就会让指定尺寸整体缩水（实测 500 -> 497）。
+            # 左列（纵向）：硬件监测 lh，余下给硬件信息
+            lh_total = left.height() or (lh + 300)
+            left.setSizes([lh, max(120, lh_total - HW - lh)])
+            # 上部（横向）：功耗结构 bw，余下给左列
+            w_total = top.width() or (UI_CARD_LIVE[0] + bw + HW)
+            top.setSizes([max(320, w_total - HW - bw), bw])
+            # 主（纵向）：底部明细 UI_DETAIL_H，余下给上部
+            h_total = sp.height() or (lh + UI_CARD_BREAKDOWN[1] + UI_DETAIL_H + HW)
+            sp.setSizes([max(300, h_total - HW - UI_DETAIL_H), UI_DETAIL_H])
+        except Exception:
+            _log.exception("分隔条初始尺寸分配失败")
 
     def _card(self, widget: QWidget):
         widget.setObjectName("card")
@@ -1596,47 +1603,7 @@ class MainWindow(QMainWindow):
             grid.setColumnStretch(_i, 1)
             _b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         outer.addLayout(grid, 1)
-        # v18.44 面板行：四个独立窗口的显示 / 隐藏
-        prow = QHBoxLayout(); prow.setContentsMargins(0, 0, 0, 0)
-        prow.setSpacing(8)
-        tip = QLabel("面板窗口：")
-        tip.setStyleSheet("font-size:12px;color:#6b7488;")
-        tip.setMinimumWidth(1)
-        prow.addWidget(tip)
-        self._panel_btns = {}
-        for key, title, _w, _h in _PANEL_SPEC:
-            b = QPushButton(title)
-            b.setObjectName("ghost")
-            b.setCheckable(True)
-            b.setChecked(True)
-            b.setMinimumWidth(96)
-            b.setToolTip(
-                "显示 / 隐藏「%s」独立窗口。\n"
-                "它是独立顶层窗口：可单独最小化到任务栏、单独拖动摆放。\n"
-                "（关闭按钮同样只是隐藏，不会停掉后台采样）" % title)
-            b.toggled.connect(lambda on, k=key: self._toggle_panel(k, on))
-            self._panel_btns[key] = b
-            prow.addWidget(b)
-        prow.addStretch(1)
-        self.btn_panels_all = QPushButton("全部显示")
-        self.btn_panels_all.setObjectName("ghost")
-        self.btn_panels_all.setMinimumWidth(88)
-        self.btn_panels_all.setToolTip("把四个面板窗口全部恢复显示")
-        self.btn_panels_all.clicked.connect(self._show_all_panels)
-        prow.addWidget(self.btn_panels_all)
-        outer.addLayout(prow)
         return c
-
-    def _show_all_panels(self):
-        """恢复显示四个面板窗口，并同步按钮勾选状态。"""
-        btns = getattr(self, "_panel_btns", None) or {}
-        for key, b in btns.items():
-            if not b.isChecked():
-                b.setChecked(True)      # toggled 信号会触发 _toggle_panel
-        for pw in (getattr(self, "panels", None) or {}).values():
-            pw.showNormal()
-            pw.raise_()
-        return
 
     @staticmethod
     def _lbl(text, kind):
@@ -3606,8 +3573,8 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 elif k == "tou_peak":
                     v = [list(x) for x in self.tou_peak]
                 data[k] = v
-            # v18.44 面板窗口几何（位置/尺寸）
-            data["frames"] = self._session_frames()
+            # v18.45 分栏布局（用户拖动出的各卡片大小）
+            data["split_state"] = self._session_frames()
             with open(SESSION_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f)
         except Exception as e:
@@ -3620,40 +3587,53 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
             self._mark_degraded("session_save", "会话保存失败·配置可能未持久化")
 
     def _session_frames(self):
-        """v18.44 收集四个面板窗口的几何 [x,y,w,h]，越界值钳制到合理范围。"""
+        """v18.45 收集各分隔条状态（base64），下次启动还原卡片大小。"""
         out = {}
-        for k, win in (getattr(self, "panels", None) or {}).items():
-            try:
-                g = win.geometry()
-                out[k] = [max(0, int(g.x())), max(0, int(g.y())),
-                          max(120, int(g.width())), max(80, int(g.height()))]
-            except Exception:
-                continue
+        sp = getattr(self, "_split_main", None)
+        if sp is None:
+            return out
+        try:
+            for name, w in (("main", sp), ("top", sp.widget(0)),
+                            ("left", sp.widget(0).widget(0))):
+                if w is not None:
+                    out[name] = bytes(w.saveState().toBase64()).decode("ascii")
+        except Exception:
+            _log.exception("分隔条状态收集失败")
         return out
 
     def _apply_session_panels(self, frames):
-        """v18.44 恢复上次的面板位置尺寸；缺失或损坏则回退默认摆放。"""
-        panels = getattr(self, "panels", None) or {}
-        if not isinstance(frames, dict) or not panels:
+        """v18.45 还原上次拖动出的卡片大小；缺失/损坏则回退默认尺寸。
+
+        restoreState 在窗口尚未 show 时算不出geometry，故延迟一帧执行。
+        """
+        sp = getattr(self, "_split_main", None)
+        if sp is None:
             return
-        ok = 0
-        for k, geo in frames.items():
-            win = panels.get(k)
-            if not (win and isinstance(geo, (list, tuple)) and len(geo) == 4):
-                continue
-            try:
-                scr = win.screen() or QApplication.primaryScreen()
-                ag = scr.availableGeometry() if scr is not None else None
-                x, y, w, h = (int(geo[0]), int(geo[1]), int(geo[2]), int(geo[3]))
-                # 完全跑出屏幕的历史坐标直接丢弃，避免"窗口失踪"
-                if ag is not None and x > ag.right() - 40 or y > ag.bottom() - 40:
-                    continue
-                win.setGeometry(x, y, max(120, w), max(80, h))
-                ok += 1
-            except Exception:
-                continue
+        if not isinstance(frames, dict) or not frames:
+            QTimer.singleShot(0, self._reset_split_sizes)
+            return
+        state = dict(frames)
+        QTimer.singleShot(0, lambda: self._restore_split_sizes(state))
+
+    def _restore_split_sizes(self, state):
+        ok = False
+        try:
+            import base64
+            sp = getattr(self, "_split_main", None)
+            if sp is not None:
+                for name, w in (("main", sp), ("top", sp.widget(0)),
+                                ("left", sp.widget(0).widget(0))):
+                    v = state.get(name)
+                    if isinstance(v, str) and v and w is not None:
+                        w.restoreState(base64.b64decode(v))
+                        ok = True
+            if ok:
+                self._split_restored = True
+        except Exception:
+            _log.warning("分隔条状态还原失败，改用默认尺寸", exc_info=True)
+            ok = False
         if not ok:
-            self._tile_panels()   # 无可用历史布局：回到默认错开摆放
+            self._reset_split_sizes()
 
     def _load_session_maybe(self):
         if not os.path.exists(SESSION_FILE):
@@ -3687,7 +3667,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 if isinstance(v, list):
                     v = [(int(a), int(b)) for a, b in v]
             setattr(self, k, v)
-        self._apply_session_panels(d.get("frames") or {})
+        self._apply_session_panels(d.get("split_state") or {})
         self._sync_settings_to_model()   # 把配置同步进功耗模型（效率/校准/额定功率）
         # 运行期累计（非配置），保持显式
         self.period_energy_wh = d.get("period_energy_wh", {"谷": 0.0, "平": 0.0, "峰": 0.0})
@@ -4366,8 +4346,6 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         self.a_mini = menu.addAction("迷你悬浮窗"); self.a_mini.setCheckable(True)
         self.a_mini.triggered.connect(lambda: self._toggle_mini(self.a_mini.isChecked()))
         # v18.10 手动生成昨日日报
-        a_panel_all = menu.addAction("显示全部面板窗口")   # v18.44
-        a_panel_all.triggered.connect(lambda: self._show_all_panels())
         a_daily = menu.addAction("生成昨日日报"); a_daily.triggered.connect(self._make_yesterday_report)
         # v18.11 显示器开关状态：手动关屏时扣除显示器功耗，避免虚高计费
         sub_disp = menu.addMenu("显示器状态")
