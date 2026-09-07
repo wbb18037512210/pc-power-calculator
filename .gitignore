@@ -52,3 +52,6 @@ _winos_*.png
 local_temp_monitor.py
 
 .pytest_cache/
+
+# 改造前的版本备份
+main.py.bak_*
