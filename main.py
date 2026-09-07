@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.45"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.46"       # 界面标题/托盘提示展示的版本号
 
 # v18.44 UI 常量：卡片更紧凑（原散落的 14/12/8）
 UI_MARGIN = 0                # 卡片内容边距
@@ -523,7 +523,8 @@ class MiniOverlay(QWidget):
         lay.addWidget(_lbl(name, c_name, bold=total), 1)
         lay.addWidget(_lbl(util_text if util_text else "", "#9fb4d8", 34))
         lay.addWidget(_lbl("%.0f W" % watts, c_val, 46, bold=total))
-        _tl = _lbl(temp_text if temp_text else "", "#9fb4d8", 48)
+        # v18.46 温度列要能放下「温度 · 显卡风扇转速」（如 41° · 1201）：48 → 58
+        _tl = _lbl(temp_text if temp_text else "", "#9fb4d8", 58)
         if temp_tip:
             _tl.setToolTip(temp_tip)
         lay.addWidget(_tl)
@@ -1447,10 +1448,22 @@ class MainWindow(QMainWindow):
                       f"{dk.get('sizeGB') or '—'}GB {dk.get('letters') or ''} "
                       f"{self._temp_html(dt, 45, 55)}</div>")
         # v18.43 风扇转速（内置 LibreHardwareMonitor 的 SuperIO / 显卡风扇）
+        # v18.46 显卡风扇单独成行，与机箱/CPU 风扇分开显示
         fans = dyn.get("fans") or []
         if fans:
-            fan_txt = " · ".join(f"{n} {v}RPM" for n, v in fans[:3])
-            LB.append(f"<div style='margin:4px 0 1px;'>{Y}风扇{E} {fan_txt}</div>")
+            _kinds = dyn.get("fan_kinds") or []
+            _pairs = []
+            for i, (n, v) in enumerate(fans):
+                k = _kinds[i] if i < len(_kinds) else "other"
+                _pairs.append((k, str(n), int(v)))
+            _gpu = [(n, v) for k, n, v in _pairs if k == "gpu"]
+            _case = [(n, v) for k, n, v in _pairs if k != "gpu"]
+            if _case:
+                fan_txt = " · ".join(f"{n} {v}RPM" for n, v in _case[:3])
+                LB.append(f"<div style='margin:4px 0 1px;'>{Y}机箱/CPU风扇{E} {fan_txt}</div>")
+            if _gpu:
+                g_txt = " · ".join(f"{n} {v}RPM" for n, v in _gpu[:2])
+                LB.append(f"<div style='margin:2px 0 1px;'>{Y}显卡风扇{E} {g_txt}</div>")
         # table 分栏（HTML 属性 width/valign——QTextDocument 对嵌套 table 的
         # CSS 不可靠，v18.32 报告排版已验证过）
         return (f"<table width='100%' cellspacing='0' cellpadding='0'>"
@@ -2090,10 +2103,72 @@ class MainWindow(QMainWindow):
         def _key(k):
             nonlocal unk
             if k in order:
-                return (order[k], 0)
+                return (order[k], 0, k)
+            # v18.46 拆行后的名字（"内存1" / "HDD2"）跟在原聚合项后面，
+            # 取最长前缀匹配，避免被当成未知项排到表尾。
+            best = None
+            for n, i in order.items():
+                if k.startswith(n) and (best is None or len(n) > len(best[0])):
+                    best = (n, i)
+            if best is not None:
+                return (best[1], 1, k)
             unk += 1
-            return (99, unk)
+            return (99, unk, k)
         return sorted(keys, key=_key)
+
+    # ---------------- v18.46 功耗构成逐条展开 ----------------
+    def _split_ram_rows(self, total: float) -> list:
+        """多条内存按容量比例拆成「内存1 / 内存2 …」（只有 1 条时保持「内存」）。"""
+        mods = [m for m in ((getattr(self, "_sys_static", None) or {}).get("mods") or [])
+                if int(m.get("cap") or 0) > 0]
+        if len(mods) < 2:
+            return [("内存", total)]
+        caps = [int(m.get("cap") or 0) for m in mods]
+        s = float(sum(caps)) or 1.0
+        rows, acc = [], 0.0
+        for i, c in enumerate(caps):
+            if i == len(caps) - 1:
+                w = round(total - acc, 1)          # 末条兜差，保证合计不变
+            else:
+                w = round(total * c / s, 1)
+                acc += w
+            rows.append((f"内存{i + 1}", w))
+        return rows
+
+    def _split_disk_rows(self, kind: str, total: float) -> list:
+        """多块同类型硬盘拆成「HDD1 / HDD2 …」（只有 1 块时保持原名）。"""
+        dks = [d for d in ((getattr(self, "_sys_static", None) or {}).get("disks") or [])
+               if kind in str(d.get("media") or "").upper()]
+        if len(dks) < 2:
+            return [(kind, total)]
+        n = len(dks)
+        rows, acc = [], 0.0
+        for i in range(n):
+            w = round(total - acc, 1) if i == n - 1 else round(total / n, 1)
+            acc += w
+            rows.append((f"{kind}{i + 1}", w))
+        return rows
+
+    def _bd_items(self, bd: dict) -> list:
+        """v18.46 构成表数据源：把聚合项拆成逐条/逐盘显示，合计与原值一致。
+
+        内存按容量比例分摊、同类型硬盘按块数均分；其余部件保持原键。
+        返回 [(显示名, 瓦数), ...]。
+        """
+        out = []
+        try:
+            for k, v in (bd or {}).items():
+                w = float(v)
+                key = str(k)
+                if key == "内存":
+                    out.extend(self._split_ram_rows(w))
+                elif key in ("HDD", "SSD"):
+                    out.extend(self._split_disk_rows(key, w))
+                else:
+                    out.append((key, w))
+        except Exception:
+            return [(str(k), float(v)) for k, v in (bd or {}).items()]
+        return out
 
     def _util_pct(self, name):
         """v18.35 使用率(0-100)：CPU=真实负载，GPU=估算功率/TDP，内存=内存占用；
@@ -2192,12 +2267,15 @@ class MainWindow(QMainWindow):
         st = dyn.get("sensor_temps") or {}
         t = None
         warn, hot = 75, 85
+        # v18.46 显卡风扇（GPU 行附带显示其转速）
+        _gf = self._gpu_fan() if "GPU" in n else None
         if "风扇" in str(name):
-            # 风扇行显示转速而非温度：取所有风扇的最高转速
-            fans = dyn.get("fans") or []
-            if not fans:
+            # 风扇行显示转速而非温度：取机箱/CPU/主板风扇的最高转速
+            # （v18.46 显卡风扇已改由 GPU 行单独显示，此处排除以免重复）
+            pairs = self._fans_except_gpu()
+            if not pairs:
                 return "—", None
-            rpm = max(int(v) for _n, v in fans)
+            rpm = max(int(v) for _n, v in pairs)
             col = QColor("#1a1a1a") if rpm < 1500 else (
                 QColor("#d99a17") if rpm < 2500 else QColor("#d8492f"))
             return f"{rpm} RPM", col
@@ -2224,17 +2302,85 @@ class MainWindow(QMainWindow):
         elif "SSD" in n or "HDD" in n:
             want = "SSD" if "SSD" in n else "HDD"
             temps = dyn.get("disk_temps") or {}
-            for dk in ((getattr(self, "_sys_static", None) or {}).get("disks") or []):
-                if want in (dk.get("media") or "").upper():
+            dks = [d for d in ((getattr(self, "_sys_static", None) or {}).get("disks") or [])
+                   if want in (d.get("media") or "").upper()]
+            # v18.46 逐盘显示（HDD1/HDD2…）：按行名末尾序号取对应那块盘
+            idx = self._bd_index(str(name))
+            if idx is not None and 0 <= idx < len(dks):
+                t = temps.get(dks[idx].get("model") or "")
+            else:
+                for dk in dks:
                     t = temps.get(dk.get("model") or "")
                     if t is not None:
                         break
             warn, hot = self._TEMP_LIMITS["disk"]
         if t is None:
+            # v18.46 GPU 无温度但显卡风扇可读时，仍把转速显示出来
+            if _gf is not None:
+                rpm = int(_gf[1])
+                col = QColor("#1a1a1a") if rpm < 1500 else (
+                    QColor("#d99a17") if rpm < 2500 else QColor("#d8492f"))
+                return f"{rpm}", col
             return "—", None
         col = QColor("#1a1a1a") if t < warn else (
             QColor("#d99a17") if t < hot else QColor("#d8492f"))
-        return f"{t:.0f}°", col
+        txt = f"{t:.0f}°"
+        if _gf is not None:
+            txt = f"{txt} · {int(_gf[1])}"      # 温度 + 显卡风扇转速
+        return txt, col
+
+    @staticmethod
+    def _bd_index(name: str):
+        """v18.46 取行名末尾的序号（'HDD2'→1、'内存2'→1）；无序号返回 None。"""
+        import re as _re
+        m = _re.search(r"(\d+)\s*$", str(name or ""))
+        if not m:
+            return None
+        try:
+            return max(0, int(m.group(1)) - 1)
+        except Exception:
+            return None
+
+    def _fans_except_gpu(self) -> list:
+        """v18.46 非显卡风扇 [(名称, RPM)]：机箱 / CPU / 主板风扇。
+
+        归属来自 hardware 的 LHM 解析（与 fans 同序的 fan_kinds）；
+        取不到归属时退化为全部风扇（保持 v18.45 及以前的行为）。
+        """
+        dyn = getattr(self, "_sys_dyn", None) or {}
+        fans = dyn.get("fans") or []
+        kinds = dyn.get("fan_kinds") or []
+        if not fans:
+            return []
+        if not kinds:
+            try:
+                kinds = H.fan_kinds_cached()
+            except Exception:
+                kinds = []
+        if not kinds:
+            return [(str(n), int(v)) for n, v in fans]
+        out = []
+        for i, (n, v) in enumerate(fans):
+            if (kinds[i] if i < len(kinds) else "other") != "gpu":
+                out.append((str(n), int(v)))
+        return out or [(str(n), int(v)) for n, v in fans]
+
+    def _gpu_fan(self):
+        """v18.46 显卡风扇 (名称, RPM)（取转速最高的一路）；无则返回 None。"""
+        dyn = getattr(self, "_sys_dyn", None) or {}
+        fans = dyn.get("fans") or []
+        kinds = dyn.get("fan_kinds") or []
+        pairs = []
+        if fans and kinds:
+            for i, (n, v) in enumerate(fans):
+                if i < len(kinds) and kinds[i] == "gpu":
+                    pairs.append((str(n), int(v)))
+        if not pairs:
+            try:
+                pairs = [(str(n), int(v)) for n, v in (H.gpu_fan_rpms() or [])]
+            except Exception:
+                pairs = []
+        return max(pairs, key=lambda x: x[1]) if pairs else None
 
     # v18.43 温度/转速列的参考读数直接取自内置 LibreHardwareMonitor，
     # 分组、命名与 Min/Value/Max 与 LHM 面板完全一致（便于逐项核对）。
@@ -2269,6 +2415,44 @@ class MainWindow(QMainWindow):
                     "（该部件在本机没有可用传感器通道）" % s)
         return ("LibreHardwareMonitor 参考读数\n"
                 + "\n".join("• %s：%s" % (a, b) for a, b in rows[:14]))
+
+    def _bd_temp_tip(self, name):
+        """v18.46 构成表「温度 / 转速」列的提示：LHM 参考读数 + 本行对应的具体硬件。
+
+        显卡风扇转速写在 GPU 行上（温度 · 转速），这里补一行说明风扇名与来源；
+        逐条展开的内存 / 硬盘行补上对应的内存条型号、硬盘型号。
+        """
+        tips = [self._temp_tooltip(name)]
+        n = str(name)
+        nu = n.upper()
+        try:
+            if "GPU" in nu:
+                gf = self._gpu_fan()
+                tips.append(f"显卡风扇「{gf[0]}」：{int(gf[1])} RPM（LibreHardwareMonitor）"
+                            if gf else
+                            "显卡风扇：未读到转速（无独立显卡风扇，或该卡未提供风扇通道）")
+            if "内存" in n:
+                mods = [m for m in ((getattr(self, "_sys_static", None) or {}).get("mods") or [])
+                        if int(m.get("cap") or 0) > 0]
+                idx = self._bd_index(n)
+                if idx is not None and 0 <= idx < len(mods):
+                    m = mods[idx]
+                    tips.append("对应内存条：%s %s %.0fGB" % (
+                        (m.get("m") or "—"), (m.get("pn") or "—"),
+                        int(m.get("cap") or 0) / (1 << 30)))
+            if "HDD" in nu or "SSD" in nu:
+                want = "HDD" if "HDD" in nu else "SSD"
+                dks = [d for d in ((getattr(self, "_sys_static", None) or {}).get("disks") or [])
+                       if want in str(d.get("media") or "").upper()]
+                idx = self._bd_index(n)
+                if idx is not None and 0 <= idx < len(dks):
+                    d = dks[idx]
+                    tips.append("对应硬盘：%s %sGB %s" % (
+                        d.get("model") or "—", d.get("sizeGB") or "—",
+                        (d.get("letters") or "")))
+        except Exception:
+            pass
+        return "\n".join(x for x in tips if x)
 
     def open_sensors(self):
         """v18.43 硬件传感器总览。
@@ -2513,19 +2697,21 @@ class MainWindow(QMainWindow):
         return ""
 
     def _refresh_breakdown(self):
-        bd = self.cur.get("breakdown", {})
-        keys = self._sorted_bd_keys(list(bd.keys()))
+        # v18.46 先展开：多条内存 / 多块 HDD(SSD) 各占一行（合计不变）
+        items = self._bd_items(self.cur.get("breakdown", {}))
+        vals = dict(items)
+        keys = self._sorted_bd_keys([k for k, _ in items])
         # v18.27 差异更新：部件集合不变时只刷新数值单元格，避免每 2s 全表重建
         if getattr(self, "_bd_keys", None) == keys and getattr(self, "_bd_val_items", None):
             for name, item, pb, ti in zip(keys, self._bd_val_items,
                                           self._bd_util_bars, self._bd_temp_items):
-                item.setText(f"{bd[name]:.1f}")
+                item.setText(f"{vals.get(name, 0.0):.1f}")
                 self._update_util_bar(pb, name)
                 pb.setToolTip(self._util_tip(name))
                 txt, col = self._temp_text_color(name)
                 ti.setText(txt)
                 ti.setForeground(col if col is not None else self._bd_temp_gray)
-                ti.setToolTip(self._temp_tooltip(name))
+                ti.setToolTip(self._bd_temp_tip(name))
             return
         self.table.setRowCount(0)
         self._bd_val_items = []
@@ -2540,12 +2726,12 @@ class MainWindow(QMainWindow):
             self._update_util_bar(cell, name)
             cell.setToolTip(self._util_tip(name))
             self.table.setCellWidget(r, 1, cell)
-            vi = QTableWidgetItem(f"{bd[name]:.1f}")
+            vi = QTableWidgetItem(f"{vals.get(name, 0.0):.1f}")
             self.table.setItem(r, 2, vi)
             txt, col = self._temp_text_color(name)
             ti = QTableWidgetItem(txt)
             ti.setForeground(col if col is not None else self._bd_temp_gray)
-            ti.setToolTip(self._temp_tooltip(name))
+            ti.setToolTip(self._bd_temp_tip(name))
             self.table.setItem(r, 3, ti)
             self._bd_val_items.append(vi)
             self._bd_util_bars.append(cell)
@@ -3238,7 +3424,10 @@ td,th{{border-bottom:1px solid #eef1f7;padding:7px 10px;text-align:left}} th{{co
         # 小时柱图
         bars = self._report_hourly_bars()
         bd = self.cur.get("breakdown", {})
-        bd_rows = "".join(f"<tr><td>{k}</td><td style='text-align:right'>{v:.1f} W</td></tr>" for k, v in bd.items())
+        # v18.46 与界面一致：逐条内存 / 逐块硬盘分行
+        _it = dict(self._bd_items(bd))
+        bd_rows = "".join(f"<tr><td>{k}</td><td style='text-align:right'>{_it[k]:.1f} W</td></tr>"
+                          for k in self._sorted_bd_keys(list(_it.keys())))
         # v18.32 横屏版式：QTextDocument **不支持 flex / column-count**（实测 4 个 flex
         # 子项 x 全为 4、y 递增，即被当作块级竖排），因此横向分栏只能用 table 实现。
         # 结构：标题行 → 4 格 KPI 一行 → 降级提示 → 主体三栏 → 双列柱图 → 脚注。
@@ -4260,14 +4449,16 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         # v18.17 第四行：功耗构成；v18.36 四列（+使用率、温度/转速）
         try:
             _bd = (self.cur or {}).get("breakdown") or {}
+            # v18.46 与主界面一致：多条内存 / 多块硬盘逐行展开
+            _items = self._bd_items(_bd)
             _util, _temp, _tip = {}, {}, {}
-            for _k in _bd:
+            for _k, _v in _items:
                 _p = self._util_pct(_k)
                 _util[_k] = f"{_p:.0f}%" if _p is not None else "—"
                 _t, _c = self._temp_text_color(_k)
                 _temp[_k] = _t
-                _tip[_k] = self._temp_tooltip(_k)
-            m.set_breakdown(_bd, _util, _temp, _tip)
+                _tip[_k] = self._bd_temp_tip(_k)
+            m.set_breakdown(dict(_items), _util, _temp, _tip)
         except Exception:
             pass
         # v18.19 右上角配置信息（硬件概要，取自启动时检测的本机配置）

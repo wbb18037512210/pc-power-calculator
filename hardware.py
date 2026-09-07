@@ -118,6 +118,8 @@ _SENSOR_TTL_OK = 10.0
 _SENSOR_TTL_FAIL = 120.0
 _SENSOR_NS = ("root/LibreHardwareMonitor", "root/OpenHardwareMonitor")
 _sensor_state = {"last_ts": 0.0, "ttl": 0.0, "fans": [], "temps": {}, "ready": False}
+# v18.46 最近一次采样里每条风扇的归属（与 fans 同序）：cpu / board / gpu / ram / other
+_FAN_KINDS: list = []
 
 # LHM 传感器名 → 语义键。同一键内关键词按优先级排序：
 # 例如 CPU Package 优先于 CPU Core #1（后者是单核温度，不代表整体）。
@@ -183,6 +185,11 @@ def _parse_lhm_json(text: str):
     温度分类靠节点 HardwareId 前缀：
       /amdcpu /intelcpu → cpu；/lpc /motherboard → 主板；/ram → 内存。
     SuperIO 坏通道（实测 110/106/103° 的 AUX 电压等效读数）用 5–100°C 过滤。
+
+    v18.46 风扇归属：fans 仍是 [(名称, RPM)]（兼容旧调用），另按同序记录每条
+    风扇所属硬件（cpu / board / gpu / ram / other）到模块级 _FAN_KINDS，
+    供 UI 单独取「显卡风扇转速」。
+
     返回 (fans, temps, ready)。
     """
     try:
@@ -190,6 +197,7 @@ def _parse_lhm_json(text: str):
     except Exception:
         return [], {}, False
     fans = []
+    fan_kinds = []
     cands = {"cpu": [], "memory": [], "motherboard": [], "gpu": []}
 
     def _val(node):
@@ -216,6 +224,9 @@ def _parse_lhm_json(text: str):
                 if tp == "Fan":
                     if v > 0:
                         fans.append((name or "Fan", int(round(v))))
+                        # v18.46 归属：显卡节点下的是显卡风扇（/gpu-nvidia/0 等）
+                        fan_kinds.append(kind if kind in ("cpu", "board", "gpu", "ram")
+                                         else "other")
                 elif 5.0 <= v <= 100.0:          # 过滤坏通道
                     low = name.lower()
                     if kind == "cpu":
@@ -248,12 +259,41 @@ def _parse_lhm_json(text: str):
         if lst:
             lst.sort(key=lambda x: x[0])
             temps[key] = round(lst[0][1], 1)
+    # v18.46 风扇归属缓存（与 fans 同序）
+    try:
+        _FAN_KINDS[:] = list(fan_kinds)
+    except Exception:
+        pass
     # v18.37 同时缓存完整传感器树（供 UI 按 LHM 的分组/命名展示原始读数）
     try:
         _LHM_SENS.update(groups=_build_lhm_tree(data), ts=time.time(), ok=True)
     except Exception:
         pass
     return fans, temps, True
+
+
+def fan_kinds_cached() -> list:
+    """与 fan_rpms_cached() 同序的风扇归属列表（长度可能小于 fans，取不到时按 other）。"""
+    fan_rpms_cached()
+    return list(_FAN_KINDS)
+
+
+def fans_by_kind(kind: str) -> list:
+    """v18.46 按归属取风扇 [(名称, RPM)]：kind = gpu | board | cpu | ram | other。
+
+    显卡风扇 kind='gpu'（LHM 硬件节点 /gpu-nvidia/0、/gpu-amd/0 下的 Fan）。
+    """
+    try:
+        fan_rpms_cached()
+        return [(n, v) for (n, v), k in zip(fan_rpms_cached(), _FAN_KINDS)
+                if k == kind]
+    except Exception:
+        return []
+
+
+def gpu_fan_rpms() -> list:
+    """v18.46 显卡风扇转速 [(名称, RPM)]；无独显风扇时为空列表。"""
+    return fans_by_kind("gpu")
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +542,10 @@ def sensor_snapshot_cached(force: bool = False):
     fans, temps, ready = _parse_lhm_json(text)
     st.update(fans=fans, temps=temps, ready=ready, last_ts=now,
               ttl=_SENSOR_TTL_OK if ready else _SENSOR_TTL_FAIL)
+    try:
+        st["fan_kinds"] = list(_FAN_KINDS)
+    except Exception:
+        pass
     return fans, temps, ready
 
 
@@ -951,6 +995,8 @@ def sample_dynamic(prev_net):
         fans, temps, ready = sensor_snapshot_cached()
         if fans:
             info["fans"] = fans
+            # v18.46 风扇归属（与 fans 同序）：供 UI 单列显卡风扇转速
+            info["fan_kinds"] = fan_kinds_cached()
         if temps:
             info["sensor_temps"] = temps
         info["sensor_ready"] = ready

@@ -5,6 +5,55 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.46 — 功耗构成：新增显卡风扇转速；多条内存、多块 HDD 逐行展开
+
+### 1. 显卡风扇转速（GPU 行的「温度 / 转速」列）
+
+之前风扇只有一项，取「全部风扇最高转速」——机箱风扇 1937RPM 会顶掉显卡风扇的
+1201RPM，等于显卡风扇永远看不到。本版按 LHM 的硬件节点把风扇分了归属：
+
+- `hardware.py`：`_parse_lhm_json` 解析 Fan 节点时，按所在硬件的 `HardwareId`
+  前缀记录归属（`cpu / board / gpu / ram / other`），存到与 `fans` **同序**的
+  `_FAN_KINDS`。`fans` 仍是 `[(名称, RPM)]`，旧调用不变。
+  新增 `fan_kinds_cached()` / `fans_by_kind(kind)` / `gpu_fan_rpms()`。
+- 构成表 **GPU 行**显示 `41° · 1201`（温度 + 显卡风扇转速）；无温度但风扇可读时
+  只显示转速；**风扇行**改为只统计非显卡风扇（机箱/CPU/主板），两行不再重复。
+- 硬件信息面板的风扇行也拆成两行：「机箱/CPU风扇」「显卡风扇」。
+- 悬浮窗温度列宽 48 → 58px，容得下 `41° · 1201`。
+
+本机实测（LHM `/gpu-nvidia/0` 下的 Fan）：机箱 Fan #1 1937RPM、显卡 1201RPM。
+
+### 2. 多条内存 / 多块硬盘逐行展开
+
+以前「内存」「HDD」是聚合一行，几块盘/几条内存只给一个总数。本版在 UI 层展开，
+**合计瓦数不变**（分摊后末行兜差）：
+
+- 内存：≥2 条时按**容量比例**分摊（8G+16G、合计 6W → 2.0W / 4.0W），行名
+  `内存1 / 内存2…`，tooltip 给出对应内存条型号与容量。
+- 硬盘：同类型 ≥2 块时按块数均分（3 块 HDD、18W → 6.0W × 3），行名
+  `HDD1 / HDD2 / HDD3`，**温度按序号取对应那块盘**（不再一律取第一块）。
+- 排序：`_sorted_bd_keys` 增加最长前缀匹配，`内存2` 紧跟 `内存`、`HDD2` 紧跟
+  `HDD`，不会被当成未知项排到表尾。
+- 主界面表格、悬浮窗构成、用电日报 HTML 三处全部统一走 `_bd_items()`。
+
+### 改动明细
+
+- `hardware.py`：`_FAN_KINDS` + `fan_kinds_cached` / `fans_by_kind` / `gpu_fan_rpms`；
+  `sensor_snapshot_cached` 缓存归属；动态信息 `info["fan_kinds"]` 随 `fans` 一起下发
+- `main.py`：新增 `_bd_index` / `_fans_except_gpu` / `_gpu_fan` / `_split_ram_rows` /
+  `_split_disk_rows` / `_bd_items` / `_bd_temp_tip`；`_temp_text_color` 支持
+  「温度 · 显卡风扇转速」与逐盘温度；`_sorted_bd_keys` 前缀排序；
+  `_refresh_breakdown` / 悬浮窗 / 日报改用 `_bd_items`
+- 版本号 `v18.45` → `v18.46`
+
+### 验证
+
+- `_smoke_v1846.py`（新增）：行集合、合计守恒（162.0 → 162.0）、内存按容量分摊、
+  GPU 行含 1201、风扇行取 1937、HDD1/2/3 分别 38°/41°/36°、悬浮窗同步展开 → **OK**
+- `tests/` 22 项、`test_headless.py`（HEADLESS_OK）、`_smoke_v1845.py` 布局冒烟全部通过
+
+---
+
 ## v18.45 — 回退 v18.44 的四窗口拆分：仍是一个主界面，卡片各自定尺寸 + 可拖动调整大小
 
 v18.44 把四个卡片拆成了独立顶层窗口，这是对需求的误读。用户要的是**同一个界面里**
