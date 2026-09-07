@@ -56,7 +56,31 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.43"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.44"       # 界面标题/托盘提示展示的版本号
+
+# v18.44 UI 常量：卡片更紧凑（原散落的 14/12/8）
+UI_MARGIN = 0                # 卡片内容边距
+UI_SPACING = 2               # 卡片内元素间距
+UI_SHADOW_BLUR = 10          # 卡片投影：更收敛（原 blur 18 / dy 2）
+UI_SHADOW_DY = 1
+# v18.44 窗口预设尺寸（用户指定）
+UI_MONITOR_W = 720
+UI_MONITOR_MIN_H = 260       # 硬件监测：用户当前高 260，可拖更高/更矮
+UI_INFO_W = 500
+UI_INFO_MIN_H = 570          # 硬件信息
+UI_BREAKDOWN_W = 500
+UI_BREAKDOWN_MIN_H = 570     # 功耗结构
+UI_DETAIL_W = 1160
+UI_DETAIL_MIN_H = 710        # 管理功耗明细
+UI_SETTINGS_W = 560
+UI_PAGER_INTERVAL_MS = 6000
+UI_PAGER_HINT_MS = 2600
+UI_TRAY_BLINK_MS = 700
+UI_ZOOM_STEP = 0.10
+UI_ZOOM_MIN = 0.50
+UI_ZOOM_MAX = 2.00
+UI_GRID_COLS = 4
+UI_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico")
 WINDOW_HOURS = 24.0
 SAMPLE_MS = 1000   # v18.32 默认采样/刷新间隔 1 秒（原 2000）。仍可在设置/曲线详情里改
 # v18.13 常见电源额定功率档位：给「按推荐填入」取最接近的档，避免填出 543W 这种不存在的规格
@@ -196,14 +220,14 @@ def _pid_alive(pid: int) -> bool:
 
 CSS = """
 QMainWindow { background: #f4f6f9; }
-QWidget#card { background: #ffffff; border-radius: 12px; border: 1px solid #e6e9ef; }
+QWidget#card { background: #ffffff; border-radius: 6px; border: 1px solid #e6e9ef; }
 QLabel#title { font-size: 13px; color: #8a93a6; }
 QLabel#big { font-size: 28px; font-weight: 700; color: #1f2a44; }
 QLabel#sub { font-size: 12px; color: #8a93a6; }
 QLabel#hw { font-size: 13px; color: #2b3552; }
 QPushButton {
-    background: #2f6bff; color: #fff; border: none; border-radius: 8px;
-    padding: 9px 16px; font-size: 13px; font-weight: 600;
+    background: #2f6bff; color: #fff; border: none; border-radius: 5px;
+    padding: 5px 10px; font-size: 13px; font-weight: 600;
 }
 QPushButton:hover { background: #2559e0; }
 QPushButton#ghost { background: #eef1f7; color: #2b3552; }
@@ -656,11 +680,59 @@ class ChartView(QChartView):
         super().mouseDoubleClickEvent(e)
 
 
+# v18.44 主界面四单元独立化：各自成为一个可单独最小化到任务栏的顶层窗口。
+# key -> (窗口标题, 宽, 高)
+_PANEL_SPEC = (
+    ("monitor",   "硬件监测",     720,  260),
+    ("sysinfo",   "硬件信息",     500,  570),
+    ("breakdown", "功耗结构",     500,  570),
+    ("detail",    "管理功耗明细", 1160, 710),
+)
+
+
+class _PanelWindow(QWidget):
+    """v18.44 承载主界面卡片的独立顶层窗口。
+
+    两个关键点：
+    - Qt.WindowType.Window：带最小化按钮且出现在任务栏；若用 Tool/SubWindow
+      标志则不会在任务栏留条目，用户就没法「单独缩小到任务栏」。
+    - closeEvent 改为 hide：真正关闭会把整棵子树连同 C++ 对象一起销毁，
+      而 MainWindow 的采样刷新槽函数持有 self.table / self.wall_big /
+      self.chart_view 等引用，下一次 on_sample 就是悬空访问崩溃。
+    """
+
+    def __init__(self, key, title, w, h, content):
+        super().__init__()
+        self._key = key
+        self.setWindowTitle(f"{title} · PC 用电电费计算器")
+        # v18.44 一次性覆盖全部窗口类型位，而不是增量 setWindowFlag：
+        # 增量写法会保留 Qt.Tool 等残留位（Tool 既不进任务栏也没有最小化按钮），
+        # 结果就是「最小化=整组窗口一起消失、任务栏里没有各自的条目」。
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setStyleSheet(CSS)          # 独立顶层窗口不继承主窗口样式表
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.addWidget(content, 1)
+        self.resize(w, h)
+        self._on_hidden = None           # 隐藏回调（主窗口用来同步按钮状态）
+
+    def closeEvent(self, e):
+        e.ignore()                       # 不真正销毁，只隐藏
+        self.hide()
+        if self._on_hidden is not None:
+            self._on_hidden(self._key)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"PC 电脑用电电费计算器 {APP_VERSION}")
-        self.resize(1080, 920)  # v18.35 +40px：实时卡片（含硬件信息块）sizeHint 需要
+        self.resize(1040, 190)  # v18.44 四个单元移出为独立窗口，主窗只剩标题+控制条
         self.setStyleSheet(CSS)
 
         # v18.29+ W3：降级账本（收敛静默异常，给维护者/用户可见信号）
@@ -712,6 +784,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._setup_tray()
+        # v18.44 四个面板窗口默认全部显示（用户可各自最小化到任务栏）
+        for _pw in (getattr(self, "panels", None) or {}).values():
+            try:
+                _pw.show()
+            except Exception:
+                _log.exception("面板窗口显示失败")
         # v18.8 迷你悬浮窗：按会话恢复显示与位置
         self.mini = MiniOverlay(on_top=getattr(self, '_mini_on_top', False),
                             show_bd=getattr(self, '_mini_bd', True))
@@ -826,8 +904,8 @@ class MainWindow(QMainWindow):
         outer.setSpacing(0)
         # v18.34 最左侧系统信息侧栏已删除，硬件信息整体并入实时卡片右侧
         page = QVBoxLayout()
-        page.setContentsMargins(18, 16, 18, 16)
-        page.setSpacing(14)
+        page.setContentsMargins(8, 7, 8, 7)
+        page.setSpacing(6)
         outer.addLayout(page, 1)
         # v18.9：设置面板改为抽屉式浮层——不挤占布局宽度，打开时浮在内容上方右侧
         self._settings_dock = QScrollArea(root)
@@ -879,18 +957,80 @@ class MainWindow(QMainWindow):
 
         # v18.5：本机配置卡片已删除——硬件信息由最左侧系统信息面板全量承载，避免重复
 
-        # 三大实时读数 + 倒计时
-        page.addWidget(self._live_card())
+        # v18.44 实时读数 / 功耗曲线 / 功耗构成 / 硬件信息 四个单元不再内嵌，
+        # 各自成为独立顶层窗口（可单独最小化到任务栏），见 _make_panels()。
+        self._make_panels()
 
-        # 图表 + 明细
-        mid = QHBoxLayout()
-        mid.setSpacing(14)
-        mid.addWidget(self._chart_card(), 3)
-        mid.addWidget(self._breakdown_card(), 2)
-        page.addLayout(mid, 1)
-
-        # 控制条
+        # 控制条（含四个面板窗口的显隐开关）
         page.addWidget(self._control_bar())
+
+    # ---------------- v18.44 独立面板窗口 ----------------
+    def _make_panels(self):
+        """把四个卡片 reparent 到 _PanelWindow 顶层窗口。
+
+        reparent 后 MainWindow 的引用（self.wall_big / self.table / self.chart_view /
+        self.sysinfo_view …）全部保持不变，采样刷新照旧写进这些控件，
+        Qt 会把重绘投递到新的父窗口。
+        """
+        self.panels = {}
+        builders = {
+            "monitor":   lambda: self._live_card(),       # 硬件监测     720x260
+            "sysinfo":   lambda: self._sysinfo_panel(),   # 硬件信息     500x570
+            "breakdown": lambda: self._breakdown_card(),  # 功耗结构     500x570
+            "detail":    lambda: self._chart_card(),      # 管理功耗明细 1160x710
+        }
+        for key, title, w, h in _PANEL_SPEC:
+            pw = _PanelWindow(key, title, w, h, builders[key]())
+            pw._on_hidden = self._on_panel_hidden
+            self.panels[key] = pw
+
+    def _on_panel_hidden(self, key):
+        """面板被关闭（实为隐藏）时，同步控制条按钮的勾选状态。"""
+        b = getattr(self, "_panel_btns", {}).get(key)
+        if b is not None and b.isChecked():
+            try:
+                b.blockSignals(True)
+                b.setChecked(False)
+            finally:
+                b.blockSignals(False)
+
+    def _toggle_panel(self, key, on):
+        pw = getattr(self, "panels", {}).get(key)
+        if pw is None:
+            return
+        pw.setVisible(bool(on))
+        if on:
+            pw.showNormal()      # 从任务栏恢复
+            pw.raise_()
+            pw.activateWindow()
+
+    def _tile_panels(self):
+        """v18.44 首次显示时把四个面板从左到右错开摆放，避免层层叠在左上角。
+
+        宽度累计超出屏幕可用宽就换行。位置只在内存里算，不落盘——
+        用户自己拖过的位置每次会话重新排布更可控。
+        """
+        try:
+            scr = QApplication.primaryScreen()
+            g = scr.availableGeometry() if scr is not None else None
+            if g is None:
+                return
+            x = g.left() + 16
+            y = g.top() + 16
+            row_h = 0
+            for key, _title, w, h in _PANEL_SPEC:
+                pw = self.panels.get(key)
+                if pw is None:
+                    continue
+                if x + w > g.right() and x > g.left():
+                    x = g.left() + 16
+                    y += row_h + 24
+                    row_h = 0
+                pw.move(x, y)
+                x += w + 12
+                row_h = max(row_h, h)
+        except Exception:
+            _log.exception("面板初始摆放失败")
 
     def _card(self, widget: QWidget):
         widget.setObjectName("card")
@@ -898,8 +1038,8 @@ class MainWindow(QMainWindow):
 
     def _hw_card(self) -> QWidget:
         c = QWidget(); self._card(c)
-        lay = QHBoxLayout(c); lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(22)
+        lay = QHBoxLayout(c); lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(12)
         ram = f"{self.hw.ram_bytes/1e9:.1f} GB" if self.hw.ram_bytes else "—"
         disk = ", ".join(f"{t} {s:.0f}G" for t, s in self.hw.disks) or "—"
         items = [
@@ -930,19 +1070,17 @@ class MainWindow(QMainWindow):
         # 之前详解行（"直流 X W + 电源损耗 Y W = 插座 Z W（效率…）"）夹在第一列里，
         # 它是最长的文本，直接把这张卡片的最小宽度顶到 1572px，
         # 主界面被连带撑到 1983px（resize(1080) 形同虚设）。挪出来就好了。
-        outer = QVBoxLayout(c); outer.setContentsMargins(16, 14, 16, 14)
-        outer.setSpacing(8)
-        # v18.34 横排：左侧读数网格 + 右侧硬件信息块（原最左侧栏整体并入，
-        # 填补 v18.5 删除本机配置卡片后留下的右侧空白）。
+        outer = QVBoxLayout(c); outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
         row = QHBoxLayout(); row.setSpacing(16)
         outer.addLayout(row, 1)
-        # v18.35 读数 2 行 x 3 列（旧 4+2 布局第二行右侧两个格子是空的，
-        # 用户截图反馈的空白）。列更宽（~200px），大号数字不再拥挤。
-        grid = QGridLayout(); grid.setHorizontalSpacing(16); grid.setVerticalSpacing(10)
+        # v18.44 硬件信息块已拆出为独立窗口，此处只剩读数网格，独占整行。
+        # 读数 2 行 x 3 列（v18.35：旧 4+2 布局第二行右侧两个格子是空的），
+        # 列更宽（~200px），大号数字不再拥挤。
+        grid = QGridLayout(); grid.setHorizontalSpacing(10); grid.setVerticalSpacing(6)
         for _c3 in range(3):
             grid.setColumnStretch(_c3, 1)   # v18.35 三列均分，避免某列被文本顶宽
-        row.addLayout(grid, 3)
-        row.addWidget(self._sysinfo_panel(), 2)
+        row.addLayout(grid, 1)
         # 插座功耗（大）
         col1 = QVBoxLayout(); col1.setSpacing(2)
         col1.addWidget(self._lbl("插座实时功耗", "title"))
@@ -1051,8 +1189,8 @@ class MainWindow(QMainWindow):
 
     def _chart_card(self) -> QWidget:
         c = QWidget(); self._card(c)
-        lay = QVBoxLayout(c); lay.setContentsMargins(14, 12, 14, 12)
-        lay.setSpacing(8)
+        lay = QVBoxLayout(c); lay.setContentsMargins(6, 5, 6, 5)
+        lay.setSpacing(3)
         h = QLabel("功耗曲线（近 60 分钟 · 插座功耗 W）· 双击查看详情")
         h.setStyleSheet("font-size:13px;color:#2b3552;font-weight:600;")
         lay.addWidget(h)
@@ -1087,8 +1225,8 @@ class MainWindow(QMainWindow):
 
     def _breakdown_card(self) -> QWidget:
         c = QWidget(); self._card(c)
-        lay = QVBoxLayout(c); lay.setContentsMargins(14, 12, 14, 12)
-        lay.setSpacing(8)
+        lay = QVBoxLayout(c); lay.setContentsMargins(6, 5, 6, 5)
+        lay.setSpacing(3)
         h = QLabel("功耗构成（估算）")
         h.setStyleSheet("font-size:13px;color:#2b3552;font-weight:600;")
         lay.addWidget(h)
@@ -1417,8 +1555,11 @@ class MainWindow(QMainWindow):
 
     def _control_bar(self) -> QWidget:
         c = QWidget(); self._card(c)
-        lay = QHBoxLayout(c); lay.setContentsMargins(14, 12, 14, 12)
-        lay.setSpacing(10)
+        # v18.44 控制条：一行功能按钮 + 一行面板显隐开关
+        outer = QVBoxLayout(c); outer.setContentsMargins(7, 6, 7, 6)
+        outer.setSpacing(5)
+        lay = QHBoxLayout(); lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
         # v18：始终监测，移除「开始监测」按钮
         self.btn_reset = QPushButton("重置"); self.btn_reset.setObjectName("ghost")
         self.btn_reset.clicked.connect(self.reset_session)
@@ -1454,8 +1595,48 @@ class MainWindow(QMainWindow):
             grid.addWidget(_b, 0, _i)
             grid.setColumnStretch(_i, 1)
             _b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        lay.addLayout(grid, 1)
+        outer.addLayout(grid, 1)
+        # v18.44 面板行：四个独立窗口的显示 / 隐藏
+        prow = QHBoxLayout(); prow.setContentsMargins(0, 0, 0, 0)
+        prow.setSpacing(8)
+        tip = QLabel("面板窗口：")
+        tip.setStyleSheet("font-size:12px;color:#6b7488;")
+        tip.setMinimumWidth(1)
+        prow.addWidget(tip)
+        self._panel_btns = {}
+        for key, title, _w, _h in _PANEL_SPEC:
+            b = QPushButton(title)
+            b.setObjectName("ghost")
+            b.setCheckable(True)
+            b.setChecked(True)
+            b.setMinimumWidth(96)
+            b.setToolTip(
+                "显示 / 隐藏「%s」独立窗口。\n"
+                "它是独立顶层窗口：可单独最小化到任务栏、单独拖动摆放。\n"
+                "（关闭按钮同样只是隐藏，不会停掉后台采样）" % title)
+            b.toggled.connect(lambda on, k=key: self._toggle_panel(k, on))
+            self._panel_btns[key] = b
+            prow.addWidget(b)
+        prow.addStretch(1)
+        self.btn_panels_all = QPushButton("全部显示")
+        self.btn_panels_all.setObjectName("ghost")
+        self.btn_panels_all.setMinimumWidth(88)
+        self.btn_panels_all.setToolTip("把四个面板窗口全部恢复显示")
+        self.btn_panels_all.clicked.connect(self._show_all_panels)
+        prow.addWidget(self.btn_panels_all)
+        outer.addLayout(prow)
         return c
+
+    def _show_all_panels(self):
+        """恢复显示四个面板窗口，并同步按钮勾选状态。"""
+        btns = getattr(self, "_panel_btns", None) or {}
+        for key, b in btns.items():
+            if not b.isChecked():
+                b.setChecked(True)      # toggled 信号会触发 _toggle_panel
+        for pw in (getattr(self, "panels", None) or {}).values():
+            pw.showNormal()
+            pw.raise_()
+        return
 
     @staticmethod
     def _lbl(text, kind):
@@ -3425,6 +3606,8 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 elif k == "tou_peak":
                     v = [list(x) for x in self.tou_peak]
                 data[k] = v
+            # v18.44 面板窗口几何（位置/尺寸）
+            data["frames"] = self._session_frames()
             with open(SESSION_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f)
         except Exception as e:
@@ -3435,6 +3618,42 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 pass
             # v18.29+ W3：落盘类失败必须给用户可见信号，否则配置悄悄丢失
             self._mark_degraded("session_save", "会话保存失败·配置可能未持久化")
+
+    def _session_frames(self):
+        """v18.44 收集四个面板窗口的几何 [x,y,w,h]，越界值钳制到合理范围。"""
+        out = {}
+        for k, win in (getattr(self, "panels", None) or {}).items():
+            try:
+                g = win.geometry()
+                out[k] = [max(0, int(g.x())), max(0, int(g.y())),
+                          max(120, int(g.width())), max(80, int(g.height()))]
+            except Exception:
+                continue
+        return out
+
+    def _apply_session_panels(self, frames):
+        """v18.44 恢复上次的面板位置尺寸；缺失或损坏则回退默认摆放。"""
+        panels = getattr(self, "panels", None) or {}
+        if not isinstance(frames, dict) or not panels:
+            return
+        ok = 0
+        for k, geo in frames.items():
+            win = panels.get(k)
+            if not (win and isinstance(geo, (list, tuple)) and len(geo) == 4):
+                continue
+            try:
+                scr = win.screen() or QApplication.primaryScreen()
+                ag = scr.availableGeometry() if scr is not None else None
+                x, y, w, h = (int(geo[0]), int(geo[1]), int(geo[2]), int(geo[3]))
+                # 完全跑出屏幕的历史坐标直接丢弃，避免"窗口失踪"
+                if ag is not None and x > ag.right() - 40 or y > ag.bottom() - 40:
+                    continue
+                win.setGeometry(x, y, max(120, w), max(80, h))
+                ok += 1
+            except Exception:
+                continue
+        if not ok:
+            self._tile_panels()   # 无可用历史布局：回到默认错开摆放
 
     def _load_session_maybe(self):
         if not os.path.exists(SESSION_FILE):
@@ -3468,6 +3687,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
                 if isinstance(v, list):
                     v = [(int(a), int(b)) for a, b in v]
             setattr(self, k, v)
+        self._apply_session_panels(d.get("frames") or {})
         self._sync_settings_to_model()   # 把配置同步进功耗模型（效率/校准/额定功率）
         # 运行期累计（非配置），保持显式
         self.period_energy_wh = d.get("period_energy_wh", {"谷": 0.0, "平": 0.0, "峰": 0.0})
@@ -3547,7 +3767,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         hist = self._load_history()
         d = QDialog(self); d.setWindowTitle("历史会话趋势"); d.setStyleSheet(CSS)
         d.resize(820, 640)
-        vl = QVBoxLayout(d); vl.setContentsMargins(16, 14, 16, 14); vl.setSpacing(12)
+        vl = QVBoxLayout(d); vl.setContentsMargins(8, 6, 8, 6); vl.setSpacing(12)
 
         if not hist:
             tip = QLabel("暂无历史记录。\n完成一次 24 小时监测（或中途重置有累计电量时）会自动归档一条记录，"
@@ -3712,7 +3932,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         """节能情景模拟：输入「每天可关机时长」「目标电源效率」，实时算出月省电量与电费。"""
         d = QDialog(self); d.setWindowTitle("节能情景模拟"); d.setStyleSheet(CSS)
         d.resize(540, 400)
-        vl = QVBoxLayout(d); vl.setContentsMargins(16, 14, 16, 14); vl.setSpacing(12)
+        vl = QVBoxLayout(d); vl.setContentsMargins(8, 6, 8, 6); vl.setSpacing(12)
 
         inp = QFormLayout(); inp.setSpacing(10)
         hoff = QDoubleSpinBox(); hoff.setRange(0, 24); hoff.setDecimals(1)
@@ -3787,7 +4007,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
             finally:
                 self._show_window()
 
-        vl = QVBoxLayout(d); vl.setContentsMargins(16, 14, 16, 14); vl.setSpacing(10)
+        vl = QVBoxLayout(d); vl.setContentsMargins(8, 6, 8, 6); vl.setSpacing(10)
 
         pts = list(getattr(self, "_chart_pts", None) or [])
         if len(pts) < 2:
@@ -3905,7 +4125,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         """用电时段分布：按一天 0–23 时展示平均插座功耗，柱按峰谷时段着色，定位高耗时段。"""
         d = QDialog(self); d.setWindowTitle("用电时段分布"); d.setStyleSheet(CSS)
         d.resize(820, 460)
-        vl = QVBoxLayout(d); vl.setContentsMargins(16, 14, 16, 14); vl.setSpacing(12)
+        vl = QVBoxLayout(d); vl.setContentsMargins(8, 6, 8, 6); vl.setSpacing(12)
 
         data = self._hourly_by_clock()
         if not data:
@@ -4146,6 +4366,8 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         self.a_mini = menu.addAction("迷你悬浮窗"); self.a_mini.setCheckable(True)
         self.a_mini.triggered.connect(lambda: self._toggle_mini(self.a_mini.isChecked()))
         # v18.10 手动生成昨日日报
+        a_panel_all = menu.addAction("显示全部面板窗口")   # v18.44
+        a_panel_all.triggered.connect(lambda: self._show_all_panels())
         a_daily = menu.addAction("生成昨日日报"); a_daily.triggered.connect(self._make_yesterday_report)
         # v18.11 显示器开关状态：手动关屏时扣除显示器功耗，避免虚高计费
         sub_disp = menu.addMenu("显示器状态")
