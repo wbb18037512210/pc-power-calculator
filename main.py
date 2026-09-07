@@ -4566,16 +4566,17 @@ def main():
     # v18.8：迷你悬浮窗是独立顶层窗口；退出统一走托盘「退出」，避免关窗误退
     app.setQuitOnLastWindowClosed(False)
     w = MainWindow()
+    # v18.45 四个卡片全部在主界面内，再像以前那样「启动即入托盘」就什么都看不到了
+    # （用户反馈的「窗口闪一下就消失」正是这个）。故启动直接显示主窗口；
+    # 后台监测不依赖窗口可见性，照常运行；点关闭仍是隐藏到托盘，不会停掉采样。
+    w.show()
     if getattr(w, "tray", None) is not None:
-        # v18 后台常驻：启动即入托盘，不占任务栏；监测已在后台自动开始
-        w.hide()
         try:
-            w.tray.showMessage("PC用电监测已启动", "后台监测运行中 · 双击托盘图标打开窗口",
+            w.tray.showMessage("PC用电监测已启动",
+                               "监测运行中 · 界面已打开，拖分隔条可调整各卡片大小",
                                QSystemTrayIcon.MessageIcon.Information, 3000)
         except Exception:
             pass
-    else:
-        w.show()
     # v18.28 真实显示器电源事件：窗口原生句柄(winId)就绪后注册 GUID_MONITOR_POWER_ON
     # 通知。tray 模式 w.hide() 后仍可创建隐藏原生窗口句柄，钩子照常生效。
     w._install_monitor_power_hook()
