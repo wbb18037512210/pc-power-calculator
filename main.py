@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.46"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.47"       # 界面标题/托盘提示展示的版本号
 
 # v18.44 UI 常量：卡片更紧凑（原散落的 14/12/8）
 UI_MARGIN = 0                # 卡片内容边距
@@ -1180,6 +1180,27 @@ class MainWindow(QMainWindow):
         for _i, _col in enumerate((col1, col2, col3, col4, col5, col7)):
             grid.addLayout(_col, _i // 3, _i % 3)
 
+        # v18.47 开机以来：读取系统开机时长，估算开机至今电费（独占整行，置于读数网格与详解行之间）
+        boot_card = QWidget(); self._card(boot_card)
+        blay = QHBoxLayout(boot_card); blay.setContentsMargins(10, 6, 10, 6); blay.setSpacing(30)
+        bcol_l = QVBoxLayout(); bcol_l.setSpacing(1)
+        bcol_l.addWidget(self._lbl("开机时长", "title"))
+        self.boot_dur = self._lbl("—", "hw")
+        self.boot_dur.setStyleSheet("font-size:22px;font-weight:700;color:#2b3552;")
+        bcol_l.addWidget(self.boot_dur)
+        bcol_r = QVBoxLayout(); bcol_r.setSpacing(1)
+        bcol_r.addWidget(self._lbl("开机至今电费（估）", "title"))
+        self.boot_cost = self._lbl("¥0.00", "hw")
+        self.boot_cost.setStyleSheet("font-size:22px;font-weight:700;color:#c2410c;")
+        bcol_r.addWidget(self.boot_cost)
+        blay.addLayout(bcol_l)
+        bsep = QFrame(); bsep.setFrameShape(QFrame.Shape.VLine); bsep.setFrameShadow(QFrame.Shadow.Sunken)
+        bsep.setStyleSheet("color:#d6dbe6;")
+        blay.addWidget(bsep)
+        blay.addLayout(bcol_r)
+        blay.addStretch(1)
+        outer.addWidget(boot_card)
+
         # v18.17 QLabel 默认「最小宽度 = 整段文本宽度」。填上真实数据后
         # （如 "1,234.5 W"、"23:59:59"）各列会互相顶宽，卡片最小宽度从
         # 空态 792px 涨到 1232px，主界面又被撑开。
@@ -1277,18 +1298,57 @@ class MainWindow(QMainWindow):
         arch = (s.get("osarch") or "").strip()
         lbl.setText(" · ".join(x for x in (os_txt, arch) if x and x != "—"))
 
+    @staticmethod
+    def _fmt_dur(sec: float) -> str:
+        """把秒数格式化为中文时长：X天X时X分 / X时X分 / X分。"""
+        sec = int(max(0, sec))
+        d, rem = divmod(sec, 86400)
+        h, rem = divmod(rem, 3600)
+        m, _ = divmod(rem, 60)
+        if d:
+            return f"{d}天{h}时{m:02d}分"
+        if h:
+            return f"{h}时{m:02d}分"
+        return f"{m}分"
+
+    def _blended_rate(self) -> float:
+        """当前有效电价（元/度）：峰谷/阶梯下取本次已累计平均单价，单一价直接取 rate。"""
+        kwh_total = self.energy_wh / 1000.0
+        if kwh_total > 0:
+            return self._current_cost() / kwh_total
+        return float(self.rate)
+
+    def _boot_info(self):
+        """返回 (时长文本, 开机电费¥, 开机秒数)；读不到开机时间返回 None。
+
+        电费＝开机时长(小时) × 当前插座功耗(kW) × 有效电价。
+        以「当前实时功率 × 全程时长」估算，等价于假设开机以来一直维持当前负载；
+        与「累计电量」不同：累计只统计本程序监测时段，开机时长包含监测开始前的时间。
+        """
+        boot = (self._sys_dyn or {}).get("boot")
+        if not boot:
+            return None
+        up_s = max(0, time.time() - boot)
+        wall = float((self.cur or {}).get("wall") or 0.0)
+        kwh = wall / 1000.0 * (up_s / 3600.0)
+        cost = kwh * self._blended_rate()
+        return (self._fmt_dur(up_s), cost, up_s)
+
     def _uptime_line(self) -> str:
-        """v18.33 运行时间行（标题后与侧栏共用）：开机时长 + 当前日期时间。"""
+        """v18.33 运行时间行（标题后与侧栏共用）：开机时长 + 开机电费 + 当前日期时间。"""
         dyn = self._sys_dyn or {}
         boot = dyn.get("boot")
         if not boot:
             return "运行 —"
         up = max(0, time.time() - boot)
-        hh, rem = divmod(int(up), 3600)
-        mm, _ss = divmod(rem, 60)
+        cost = 0.0
+        wall = float((self.cur or {}).get("wall") or 0.0)
+        if wall:
+            cost = wall / 1000.0 * (up / 3600.0) * self._blended_rate()
         now = datetime.now()
         wk = "一二三四五六日"[now.weekday()]
-        return (f"运行 {hh}时{mm:02d}分 · {now:%m-%d} [{wk}] {now:%H:%M}")
+        return (f"运行 {self._fmt_dur(up)} · 开机电费 ¥{cost:,.2f} · "
+                f"{now:%m-%d} [{wk}] {now:%H:%M}")
 
     def _sysinfo_panel(self) -> QWidget:
         """v18.35 改为内嵌块：不再是最左侧固定宽侧栏，而是实时卡片右半区。
@@ -1379,6 +1439,11 @@ class MainWindow(QMainWindow):
         # QTextDocument 唯一可靠的分栏方案），高度减半、不再滚动。
         LA = []   # 左列：主板/处理器/内存/网络
         LB = []   # 右列：显卡/磁盘
+        # v18.47 开机以来：时长 + 估算电费（读取系统开机时间，按当前功耗外推）
+        _bi = self._boot_info()
+        if _bi:
+            LA.append(f"<div style='margin:2px 0 4px 0;'>{Y}开机以来{E} {_bi[0]} · "
+                      f"开机电费 ¥{_bi[1]:,.2f}</div>")
         # v18.35 「启动模式」按用户要求删除（UEFI/Legacy + SecureBoot 属低频
         # 信息，占一行空间不值）；v18.33 起运行时间/操作系统也已在顶部标题后
         LA.append(f"<div style='margin:2px 0 3px 0;'>{Y}主　板{E} "
@@ -1962,6 +2027,14 @@ class MainWindow(QMainWindow):
         self.proj_hour.setText(f"¥{hour_cost:,.2f}")
         self.proj_day.setText(f"¥{day_cost:,.2f}")
         self.proj_month.setText(f"¥{month_cost:,.0f}")
+        # v18.47 开机以来电费（读取系统开机时长 × 当前功耗 × 有效电价）
+        _bi = self._boot_info()
+        if _bi:
+            self.boot_dur.setText(_bi[0])
+            self.boot_cost.setText(f"¥{_bi[1]:,.2f}")
+        else:
+            self.boot_dur.setText("—")
+            self.boot_cost.setText("—")
         # v18 系统信息侧栏
         self._update_sysinfo()
 
