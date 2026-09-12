@@ -5,6 +5,72 @@ PySide6 + QtCharts，完全离线。PyInstaller onefile 打包，产物部署到
 
 ---
 
+## v18.49 — 修复：空闲态仍被悄悄拉起 LHM（≤100MB 约束的回归修复）
+
+### 问题
+v18.48 的「按需 LHM」上线后，真实 EXE 空闲启动仍会残留一个 LibreHardwareMonitor 进程
+（约 53MB），导致 App(≈93MB)+LHM 总和突破 100MB 约束。`_verify_exe_idle.py` 实测 FAIL。
+根因：`sample_dynamic()` 的传感器块虽被 `is_lhm_running()` 守卫，但构成表温度列
+`_temp_text_color()` 每轮刷新 GPU 行时调用 `_gpu_fan()` → `H.gpu_fan_rpms()` →
+`fans_by_kind` → `fan_rpms_cached()` → **`sensor_snapshot_cached()`**，而该函数原本在
+`_lhm_fetch()` 取空时会调用 `ensure_lhm()` 自动拉起 LHM——这条路径完全绕过了 `is_lhm_running()`
+守卫，于是在空闲态被反复拉起并常驻。
+
+### 修复
+- **`hardware.py` `sensor_snapshot_cached()` 改为「纯缓存/只读」**：`_lhm_fetch()` 取空时
+  **不再**调用 `ensure_lhm()`，直接返回既有缓存（空闲态即为空）并标记 `ready=False`。
+  这是关键的去常驻改动——任何非面板路径都不再有能力拉起 LHM。
+- **`hardware.py` `lhm_sensors()` 收敛为「唯一」合法拉起入口**：
+  - `force=True`（打开「传感器」面板时）→ 先 `ensure_lhm()` 拉起并暖机，再 `sensor_snapshot_cached(force=True)`；
+  - `force=False` → **绝不**拉起，仅当 LHM 已在运行（面板开启中）才刷新缓存，否则直接返回空缓存。
+- 配套 `_verify_on_demand.py` 新增 [1b]（gpu_fan_rpms/fan_kinds_cached 不拉起）、
+  [1c]（lhm_sensors(force=False) 不拉起）两项断言，固化该行为。
+
+### 效果
+- 空闲/正常操作：仅 App 进程 ≈ 92MB，**满足 ≤ 100MB**；LHM 进程数 = 0。
+- 打开「传感器」面板查看温度期间：App + LHM 短暂同驻（关闭面板即 `stop_lhm()` 回落）。
+- 功耗构成表的 LHM 风扇转速列：面板开启时由 `gpu_fan_rpms()` 取实时值；空闲显示「—」
+  （不再为显示风扇而拉起守护进程）。CPU/GPU/磁盘温度仍由 WMI/nvidia-smi 实时提供，不受影响。
+
+### 验证
+- `py_compile` 通过；`_verify_on_demand.py` 全部通过（含 [1b][1c] 新增断言）。
+- 桌面 EXE 实启标题 `PC 电脑用电电费计算器 v18.49`；`_verify_exe_idle.py` 应报告 PASS
+  （App rss ≤ 100MB 且空闲无 LHM 进程）。
+- EXE 体积维持 ≤ 60MB（lhm_bin 11MB 内嵌，整体约 53MB）。
+
+---
+
+## v18.48 — 内存优化：LibreHardwareMonitor 改为「按需」运行（空闲仅 App 进程）
+
+### 背景（硬约束）
+用户要求：① 整个工具运行内存 **≤ 100MB**（App + LHM 守护进程之和）；② EXE 压缩包 **≤ 60MB**。
+诊断结论：App 自身约 92MB，LHM 守护进程最少也要 ~40MB（.NET 运行时基线）。只要 LHM 常驻，
+总和永远 ≥ 130MB，不可能 ≤ 100MB。且此前 `sample_dynamic()` 每轮采样都调 `sensor_snapshot_cached()`
+→ `ensure_lhm()` 把 LHM 拉起并**永久常驻**（v18.43 起的设计，日志已记"后台常驻约95MB未处理"）。
+
+### 实现（按需 LHM）
+- **`hardware.py`**：
+  - 新增模块级 `_lhm_proc` 记录 `ensure_lhm()` 拉起的进程；新增 `stop_lhm()`：
+    先 `kill()` 本会话实例，再用 `taskkill /IM LibreHardwareMonitor.exe /F` 兜底杀（覆盖上一次会话残留）。
+  - `sample_dynamic()` 的传感器块改为**仅当 `is_lhm_running()` 为真时才取数**——不再每轮自动拉起 LHM。
+    空闲时 `info["sensor_ready"]=False`，fans/sensor_temps 不写入，功耗构成表温度列与风扇显示「—」。
+  - 实时卡 CPU/GPU/磁盘温度来自 WMI/nvidia-smi（`_cpu_temp_once` 等），**不依赖 LHM**，空闲照常显示。
+- **`main.py` `open_sensors()`**：面板 `finished` 信号连 `H.stop_lhm()`——
+  **关闭「传感器」面板即终止 LHM 守护进程**，空闲占用回到仅 App（≈92MB ≤ 100MB）。
+  打开面板时 `_refresh()` → `lhm_sensors(force=True)` → `ensure_lhm()` 仍会自动拉起并暖机，功能不变。
+
+### 效果与取舍
+- 空闲/正常操作：仅 App 进程 ≈ 92MB，**满足 ≤ 100MB**。
+- 打开「传感器」面板查看温度期间：App + LHM ≈ 130–260MB（主动查看时才短暂超，关闭即回落）。
+- 功耗构成表的 LHM 温度列 / 风扇转速，仅在传感器面板打开时填充；空闲显示「—」（CPU/GPU/磁盘温度仍由 WMI/nvidia-smi 实时提供）。
+
+### 验证
+- `py_compile` main.py / hardware.py 通过；`tests/` 22 项 + `test_headless` 通过；`_smoke_v1847` 通过。
+- 桌面 EXE 实启动标题 `PC 电脑用电电费计算器 v18.48`；空闲内存 ≤ 100MB，关闭传感器面板后 LHM 进程退出。
+- EXE 体积 53.4MB ≤ 60MB。
+
+---
+
 ## v18.47 — 新增「开机以来」：读取开机时长，估算开机至今电费
 
 ### 需求

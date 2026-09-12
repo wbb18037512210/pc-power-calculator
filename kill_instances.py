@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 
-TARGETS = ("PC用电电费计算器", "PC电费_debug")   # 前缀匹配：产物带版本号也能杀到
+TARGETS = ("PC用电电费计算器", "PC电费_debug", "LibreHardwareMonitor")   # 前缀匹配：产物带版本号也能杀到；含 LHM 守护进程
 
 
 def _running_names() -> list[str]:

@@ -339,10 +339,19 @@ def _build_lhm_tree(root) -> list:
 def lhm_sensors(force: bool = False) -> dict:
     """返回 {"ok", "ts", "groups"}：与 LHM 面板同构的全部传感器（含 Min/Max）。
 
-    force=True 会立即重新拉一次 /data.json（普通采样有 10s 缓存）。
+    force=True 会先确保内置 LHM 已在后台运行（按需拉起），再立即重新拉一次
+    /data.json（普通采样有 10s 缓存）。这是**唯一**会拉起 LHM 的入口——只在用户
+    打开「传感器」面板时触发。
+    force=False 则**绝不**拉起 LHM：仅当 LHM 已在运行（面板开启中）时才刷新缓存，
+    其余情况直接返回既有缓存（空闲态即空）。避免任何非面板路径悄悄拉起 LHM，
+    使整个工具常驻内存突破 100MB。
     """
-    if force or not _LHM_SENS.get("groups"):
+    if force:
+        if not is_lhm_running():
+            ensure_lhm()                       # v18.48 按需：仅在打开面板时显式拉起
         sensor_snapshot_cached(force=True)
+    elif is_lhm_running():
+        sensor_snapshot_cached()
     return dict(_LHM_SENS)
 
 
@@ -440,6 +449,7 @@ _LHM_EXE = "LibreHardwareMonitor.exe"
 # 等这一小会儿，让交给 UI 的首帧就是完整的，不必等下一个 10s 周期。
 _LHM_WARMUP = 1.5
 _lhm_state = {"retry_after": 0.0, "launched_ts": 0.0}
+_lhm_proc = None  # v18.48 按需模式：记录 ensure_lhm 拉起的 LHM 进程，便于关闭面板时精确终止
 
 
 def _lhm_bin_dir() -> str:
@@ -480,6 +490,7 @@ def ensure_lhm(wait: float = 12.0) -> bool:
     返回 True 表示此刻可以取到 /data.json。
     """
     now = time.time()
+    global _lhm_proc
     if is_lhm_running():
         _lhm_state["retry_after"] = 0.0
         return True
@@ -518,6 +529,37 @@ def ensure_lhm(wait: float = 12.0) -> bool:
     return False
 
 
+def stop_lhm():
+    """v18.48 按需模式：终止后台 LibreHardwareMonitor 守护进程。
+
+    在「传感器」面板关闭时调用，让空闲占用回到仅 App 进程（≈92MB，≤100MB）。
+    先终止本会话经 ensure_lhm 拉起的实例，再按映像名兜底杀（覆盖上一次会话残留）。
+    返回是否执行了 kill。
+    """
+    global _lhm_proc
+    killed = False
+    p = _lhm_proc
+    if p is not None:
+        try:
+            if p.poll() is None:
+                p.kill()
+                killed = True
+        except Exception:
+            pass
+        _lhm_proc = None
+    try:
+        # 兜底：按映像名强杀（DETACHED 子进程可能脱离我们的 handle）
+        subprocess.run(["taskkill", "/IM", _LHM_EXE, "/F"],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                      creationflags=0x08000000, timeout=5)
+        killed = True
+    except Exception:
+        pass
+    _lhm_state["retry_after"] = 0.0
+    _lhm_state["launched_ts"] = 0.0
+    return killed
+
+
 def sensor_snapshot_cached(force: bool = False):
     """(fans, temps, ready)：10s 缓存；force 用于「重新检测硬件」立即刷新。
 
@@ -531,10 +573,12 @@ def sensor_snapshot_cached(force: bool = False):
     if not force and now - st["last_ts"] < st["ttl"]:
         return st["fans"], st["temps"], st["ready"]
 
+    # v18.48 按需模式：本函数只读取缓存或 LHM「当前已在运行」时的数据，**绝不**
+    # 自动拉起守护进程。拉起 LHM 的唯一入口是 lhm_sensors(force=True)（用户打开
+    # 「传感器」面板时）。否则空闲态下任何采样/刷新路径（如构成表温度列 _gpu_fan
+    # → gpu_fan_rpms → sensor_snapshot_cached）都会经此悄悄拉起 LHM，使整机内存
+    # 突破 100MB 约束。
     text = _lhm_fetch()
-    if text is None:
-        ensure_lhm()
-        text = _lhm_fetch()
     if text is None:
         st.update(last_ts=now, ttl=_SENSOR_TTL_FAIL, ready=False)
         return st["fans"], st["temps"], False
@@ -988,18 +1032,22 @@ def sample_dynamic(prev_net):
                 info["up_kbs"] = max(0.0, (cur[1] - prev_net[1]) / dt / 1024.0)
         except Exception:
             pass
-    # v18.36 传感器快照（风扇 + CPU/内存/主板温度；内部 10s 缓存节流，
-    # worker 线程执行，不卡 UI）。数据源为 LibreHardwareMonitor/OpenHardwareMonitor，
-    # 没装则 fans/temps 为空、sensor_ready=False（UI 据此提示）。
+    # v18.48 按需温度传感器：仅当 LHM 已在运行（用户打开了「传感器」面板）时才取数，
+    # 不再每轮自动拉起守护进程——避免常驻导致整个工具内存超过 100MB。
+    # 实时卡上的 CPU/GPU/磁盘温度来自 WMI/nvidia-smi（见 _cpu_temp_once 等），不依赖 LHM，
+    # 因此空闲时仅 App 进程驻留（≈92MB），LHM 只在查看传感器时短暂运行。
     try:
-        fans, temps, ready = sensor_snapshot_cached()
-        if fans:
-            info["fans"] = fans
-            # v18.46 风扇归属（与 fans 同序）：供 UI 单列显卡风扇转速
-            info["fan_kinds"] = fan_kinds_cached()
-        if temps:
-            info["sensor_temps"] = temps
-        info["sensor_ready"] = ready
+        if is_lhm_running():
+            fans, temps, ready = sensor_snapshot_cached()
+            if fans:
+                info["fans"] = fans
+                # v18.46 风扇归属（与 fans 同序）：供 UI 单列显卡风扇转速
+                info["fan_kinds"] = fan_kinds_cached()
+            if temps:
+                info["sensor_temps"] = temps
+            info["sensor_ready"] = ready
+        else:
+            info["sensor_ready"] = False
     except Exception:
         pass
     return info, cur

@@ -56,7 +56,7 @@ import power_model as PM
 import power_core as PC
 
 DEFAULT_RATE = 0.56          # 元 / 千瓦时（居民电价参考，可在设置中修改）
-APP_VERSION = "v18.47"       # 界面标题/托盘提示展示的版本号
+APP_VERSION = "v18.49"       # 界面标题/托盘提示展示的版本号
 
 # v18.44 UI 常量：卡片更紧凑（原散落的 14/12/8）
 UI_MARGIN = 0                # 卡片内容边距
@@ -2749,6 +2749,8 @@ class MainWindow(QMainWindow):
         bar.addWidget(btn_close)
         vl.addLayout(bar)
         self._mon_dlg = d
+        # v18.48 按需 LHM：面板关闭即终止守护进程，空闲占用回到仅 App（≤100MB）
+        d.finished.connect(lambda *a: H.stop_lhm())
         d.show()
     def _on_table_dbl(self, r, c):
         """双击构成表「温度/转速」列 → 打开 LHM 传感器详情对照。"""
@@ -4714,6 +4716,7 @@ CPU 与其余部件按负载/经验模型估算，结果仅供参考。{calib_no
         if not self.finished and self.energy_wh > 0:
             self._archive_current()   # 退出时若有未归档的在监测数据则归档
         self._save_session()
+        H.stop_lhm()                  # v18.48 退出时一并终止 LHM 守护进程，避免残留占用内存
         QApplication.instance().quit()
 
     def _read_autostart(self) -> bool:
